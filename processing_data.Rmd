@@ -1,0 +1,541 @@
+---
+title: "zinnia_data_processing"
+output:
+  pdf_document: default
+  html_notebook: default
+editor_options:
+  chunk_output_type: inline
+---
+
+# Libraries
+```{r}
+library(tidyverse)
+library(AwsCloud)
+library(dplyr)
+library(lubridate)
+library(arrow)
+```
+
+```{r}
+options(scipen = 999)
+```
+
+```{r}
+var1 <- "/home/xigprst"
+source("~/.creds.R")
+aws.db <- aws_login_connect('edwprod00', passwdprod, 'prod')
+```
+
+```{r}
+# Configuration
+CONFIG <- list(
+    output_path = "~/rstudio/zin_qual_monitor_prototype/",
+    data_file_prefix = "zinnia_tpa_oversight",    
+    timestamp_file = "last_update.txt",
+    log_file = "data_processing.log"
+)
+```
+
+```{r}
+# Logging function
+log_message <- function(msg) {
+    timestamp <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+    log_entry <- paste(timestamp, "-", msg)
+    cat(log_entry, "\n")
+    write(log_entry, file = file.path(CONFIG$output_path, CONFIG$log_file), append = TRUE)
+}
+```
+
+```{r}
+# Replace everything from the function definition through the return statement
+create_full_lookup <- function(db_connection, contracts, cutoff_date) {
+    # Load roles for contracts
+    roles_raw <- dplyr::tbl(db_connection, dbplyr::in_schema('edw_dl_se2','roles')) %>%
+        filter(role_cont %in% !!contracts, role_cycle_date >= !!cutoff_date) %>%
+        select(role_cont, role_source, role_cycle_date, role_type,
+               role_nm_id, role_eff_date, role_end_date,
+               role_ext_id, role_rel_code, role_pct, role_rider_code,
+               role_coverage_num, role_rider_claim_date) %>%
+        distinct() %>%
+        collect()
+
+    # Get unique IDs for filtering
+    name_ids <- unique(roles_raw$role_nm_id)
+    external_ids <- unique(roles_raw$role_ext_id)
+
+    # Load names using %in% instead of semi_join
+    names_raw <- dplyr::tbl(db_connection, dbplyr::in_schema('edw_dl_se2','names')) %>%
+        filter(name_cycle_date >= !!cutoff_date, name_nm_id %in% !!name_ids) %>%
+        select(name_cycle_date, name_nm_id, name_name_type, name_fst_name,
+               name_lg_name, name_dob, name_gender, name_dod, name_email) %>%
+        distinct() %>%
+        collect()
+
+    # Load agents using %in% instead of semi_join
+    agents_raw <- dplyr::tbl(db_connection, dbplyr::in_schema('edw_dl_se2','agent')) %>%
+        filter(agnt_cycle_date >= !!cutoff_date, agnt_external_id %in% !!external_ids) %>%
+        select(agnt_source, agnt_cycle_date, agnt_external_id,
+               agnt_org_name, agnt_master_group_id) %>%
+        distinct() %>%
+        collect()
+
+    # Filter to latest records to avoid many-to-many joins
+    names_filtered <- names_raw %>%
+        group_by(name_nm_id) %>%
+        slice_max(name_cycle_date, n = 1, with_ties = FALSE) %>%
+        ungroup()
+
+    agents_filtered <- agents_raw %>%
+        group_by(agnt_external_id) %>%
+        slice_max(agnt_cycle_date, n = 1, with_ties = FALSE) %>%
+        ungroup()
+
+    # Combine with renamed columns
+    combined <- roles_raw %>%
+        rename(Role_Contract_ID = role_cont, Role_TPA = role_source,
+               Role_Cycle_Date = role_cycle_date, Role_Type = role_type,
+               Role_Name_ID = role_nm_id, Role_Effective_Date = role_eff_date,
+               Role_End_Date = role_end_date, Role_External_ID = role_ext_id,
+               Role_Relationship_Code = role_rel_code, Role_Allocation_Percent = role_pct,
+               Role_Coverage_ID = role_coverage_num, Role_Rider_Code = role_rider_code,
+               Role_Rider_Claim_Date = role_rider_claim_date) %>%
+        left_join(
+            names_filtered %>% rename(Name_Cycle_Date = name_cycle_date, Name_ID = name_nm_id, Name_Type = name_name_type,
+                                      Name_First_Name = name_fst_name, Name_Legal_Name = name_lg_name,
+                                      Name_DOB = name_dob, Name_Gender = name_gender,
+                                      Name_DOD = name_dod, Name_Email = name_email),
+            by = c("Role_Name_ID" = "Name_ID")
+        ) %>%
+        left_join(
+            agents_filtered %>% rename(Agent_TPA = agnt_source, Agent_Cycle_Date = agnt_cycle_date,
+                                       Agent_External_ID = agnt_external_id, Agent_Organization_Name = agnt_org_name,
+                                       Agent_Master_Group_ID = agnt_master_group_id),
+            by = c("Role_External_ID" = "Agent_External_ID")
+        ) %>%
+        # Remove duplicates where same person has multiple role types for same contract
+        group_by(Role_Contract_ID, Name_First_Name, Name_Legal_Name) %>%
+        slice_head(n = 1) %>%
+        ungroup() %>%
+        distinct(Role_Contract_ID, Role_Name_ID, Role_External_ID, Role_Type, .keep_all = TRUE)
+
+    return(combined)
+}
+```
+
+## Setup and Configuration
+```{r}
+cat("Starting data processing function...\n")
+log_message("Starting data processing")
+
+# Dynamic cutoff date
+cutoff_date <- floor_date(Sys.Date() - months(1), "month")
+cat("Using cutoff date:", as.character(cutoff_date), "\n")
+log_message(paste("Using cutoff date:", cutoff_date))
+```
+
+```{r}
+# Sample contracts
+cat("Retrieving contract sample from all data sources...\n")
+# Get contracts from all data sources
+trans_contracts <- dplyr::tbl(aws.db, dbplyr::in_schema('edw_dl_se2','transactions')) %>%
+    filter(tran_cycle_date >= !!cutoff_date) %>%
+    mutate(month_year = floor_date(tran_cycle_date, "month")) %>%
+    group_by(month_year) %>%
+    slice_sample(n = 50) %>%
+    ungroup() %>%
+    select(tran_cont) %>%
+    distinct()
+```
+
+```{r}
+aact_contracts <- dplyr::tbl(aws.db, dbplyr::in_schema('edw_dl_se2','automatedactivity')) %>%
+    filter(aact_cycle_date >= !!cutoff_date) %>%
+    mutate(month_year = floor_date(aact_cycle_date, "month")) %>%
+    group_by(month_year) %>%
+    slice_sample(n = 50) %>%
+    ungroup() %>%
+    select(aact_cont) %>%
+    rename(tran_cont = aact_cont) %>%
+    distinct()
+```
+
+```{r}
+poly_contracts <- dplyr::tbl(aws.db, dbplyr::in_schema('edw_dl_se2','policy')) %>%
+    filter(poly_cycle_date >= !!cutoff_date) %>%
+    mutate(month_year = floor_date(poly_cycle_date, "month")) %>%
+    group_by(month_year) %>%
+    slice_sample(n = 50) %>%
+    ungroup() %>%
+    select(poly_cont) %>%
+    rename(tran_cont = poly_cont) %>%
+    distinct()
+```
+
+```{r}
+disb_contracts <- dplyr::tbl(aws.db, dbplyr::in_schema('edw_dl_se2','disbursements')) %>%
+    filter(disb_cycle_date >= !!cutoff_date) %>%
+    mutate(month_year = floor_date(disb_cycle_date, "month")) %>%
+    group_by(month_year) %>%
+    slice_sample(n = 50) %>%
+    ungroup() %>%
+    select(disb_cont) %>%
+    rename(tran_cont = disb_cont) %>%
+    distinct()
+```
+
+```{r}
+claims_contracts <- dplyr::tbl(aws.db, dbplyr::in_schema('edw_dl_se2','claims')) %>%
+    filter(clam_cycle_date >= !!cutoff_date) %>%
+    mutate(month_year = floor_date(clam_cycle_date, "month")) %>%
+    group_by(month_year) %>%
+    slice_sample(n = 50) %>%
+    ungroup() %>%
+    select(clam_cont) %>%
+    rename(tran_cont = clam_cont) %>%
+    distinct()
+```
+
+```{r}
+annuity_contracts <- dplyr::tbl(aws.db, dbplyr::in_schema('edw_dl_se2','annuityvalues')) %>%
+    filter(annv_cycle_date >= !!cutoff_date) %>%
+    mutate(month_year = floor_date(annv_cycle_date, "month")) %>%
+    group_by(month_year) %>%
+    slice_sample(n = 50) %>%
+    ungroup() %>%
+    select(annv_cont) %>%
+    rename(tran_cont = annv_cont) %>%
+    distinct()
+```
+
+```{r}
+life_contracts <- dplyr::tbl(aws.db, dbplyr::in_schema('edw_dl_se2','lifevalues')) %>%
+    filter(lifv_cycle_date >= !!cutoff_date) %>%
+    mutate(month_year = floor_date(lifv_cycle_date, "month")) %>%
+    group_by(month_year) %>%
+    slice_sample(n = 50) %>%
+    ungroup() %>%
+    select(lifv_cont) %>%
+    rename(tran_cont = lifv_cont) %>%
+    distinct()
+```
+
+```{r}
+contract_sample <- unique(c(
+    trans_contracts %>% collect() %>% pull(tran_cont),
+    aact_contracts %>% collect() %>% pull(tran_cont),
+    poly_contracts %>% collect() %>% pull(tran_cont),
+    disb_contracts %>% collect() %>% pull(tran_cont),
+    claims_contracts %>% collect() %>% pull(tran_cont),
+    annuity_contracts %>% collect() %>% pull(tran_cont),
+    life_contracts %>% collect() %>% pull(tran_cont)
+))
+
+cat("Retrieved", length(contract_sample), "sample contracts from all data sources\n")
+log_message(paste("Retrieved", length(contract_sample), "sample contracts from all data sources"))
+```
+
+```{r}
+# Call the lookup function to create the data
+agent_name_role_lookup <- create_full_lookup(aws.db, contract_sample, cutoff_date)
+```
+
+```{r}
+cat("Loading agent-name-role lookup...\n")
+log_message("Loading agent-name-role lookup...")
+
+lookup_file <- file.path(CONFIG$output_path, "agent_name_role_lookup.parquet")
+write_parquet(agent_name_role_lookup, lookup_file)
+
+log_message("Created lookup file")
+```
+
+```{r}
+# Load all datasets
+cat("Loading transactions...\n")
+log_message("Loading transactions...")
+trans_v4 <- dplyr::tbl(aws.db, dbplyr::in_schema('edw_dl_se2','transactions')) %>%
+    filter(tran_cont %in% !!contract_sample, tran_cycle_date >= !!cutoff_date) %>%
+    mutate(
+        tran_txn = as.character(tran_txn)
+    ) %>%
+    select(tran_txn, tran_source,
+           tran_cycle_date, tran_cont, tran_fund_name, tran_code, tran_type,
+           tran_sub_type, tran_detail_type, tran_eff_date, tran_posted_date,
+           tran_reversal_date, tran_tran_amt, tran_fund_amt, tran_fund_trans_amt,
+           tran_deposit_date, tran_init_dpst_date, tran_last_dpst_date,
+           tran_basis_points, tran_trans_status,
+           tran_int_rate) %>%
+    distinct(tran_txn, .keep_all = TRUE) %>%
+    collect() %>%
+    left_join(., agent_name_role_lookup, by = c("tran_cont" = "Role_Contract_ID"),
+              relationship = "many-to-many") %>%
+    distinct(tran_txn, Role_Name_ID, Name_DOB, .keep_all= TRUE)
+```
+
+```{r}
+cat("Loading automated activity...\n")
+log_message("Loading automated activity...")
+aact_v4 <- dplyr::tbl(aws.db, dbplyr::in_schema('edw_dl_se2','automatedactivity')) %>%
+    filter(aact_cont %in% !!contract_sample, aact_cycle_date >= !!cutoff_date) %>%
+    mutate(
+        aact_nm_id = as.character(aact_nm_id)
+    ) %>%
+    select(aact_cont, aact_source, aact_cycle_date, aact_act_type, aact_amt_type,
+           aact_freq, aact_act_amt, aact_act_start, aact_act_end,
+           aact_next_trans_date, aact_act_status, aact_amt_categ,
+           aact_trans_end_date, aact_nm_id) %>%
+    distinct(aact_cont, aact_act_type, aact_act_start, .keep_all = TRUE) %>%
+    collect() %>%
+    left_join(., agent_name_role_lookup, by = c("aact_cont" = "Role_Contract_ID"),
+              relationship = "many-to-many") %>%
+    distinct(aact_cont, Role_Name_ID, .keep_all= TRUE)
+```
+
+```{r}
+cat("Loading policies...\n")
+log_message("Loading policies...")
+poly_v4 <- dplyr::tbl(aws.db, dbplyr::in_schema('edw_dl_se2','policy')) %>%
+    filter(poly_cont %in% !!contract_sample, poly_cycle_date >= !!cutoff_date) %>%
+    mutate(
+        poly_product_type = as.character(poly_product_type),
+        poly_lst_txn_num = as.character(poly_lst_txn_num)
+    ) %>%
+    select(poly_cont, poly_source, poly_cycle_date, poly_company,
+           poly_product, poly_product_type, poly_status, poly_issue_date,
+           poly_mat_date, poly_term_date, poly_lst_txn_date,
+           poly_issue_state, poly_prim_issue_age, poly_marital_status, poly_planned_prem
+    ) %>%
+    distinct(poly_cont, poly_cycle_date, .keep_all = TRUE) %>%
+    collect() %>%
+    left_join(., agent_name_role_lookup, by = c("poly_cont" = "Role_Contract_ID"),
+              relationship = "many-to-many") %>%
+    distinct(poly_cont, Role_Name_ID, .keep_all= TRUE)
+```
+
+```{r}
+cat("Loading disbursements...\n")
+log_message("Loading disbursements...")
+disb_v4 <- dplyr::tbl(aws.db, dbplyr::in_schema('edw_dl_se2','disbursements')) %>%
+    filter(disb_cont %in% !!contract_sample, disb_cycle_date >= !!cutoff_date) %>%
+    mutate(
+        disb_disb = as.character(disb_disb),
+        disb_nm_id = as.character(disb_nm_id)
+    ) %>%
+    select(disb_disb, disb_source, disb_cycle_date, disb_cont,
+           disb_disb_code, disb_disb_desc, disb_date,
+           disb_gross_amt, disb_net_amt, disb_nm_id,
+           disb_fed_tax, disb_state_tax, disb_state_allowed, disb_alloc_perc) %>%
+    distinct(disb_disb, .keep_all = TRUE) %>%
+    collect() %>%
+    left_join(., agent_name_role_lookup, by = c("disb_cont" = "Role_Contract_ID"),
+              relationship = "many-to-many") %>%
+    distinct(disb_disb, Role_Name_ID, .keep_all= TRUE)
+```
+
+```{r}
+cat("Loading claims...\n")
+log_message("Loading claims...")
+clam_v4 <- dplyr::tbl(aws.db, dbplyr::in_schema('edw_dl_se2','claims')) %>%
+    filter(clam_cont %in% !!contract_sample, clam_cycle_date >= !!cutoff_date) %>%
+    mutate(
+        clam_claim_id = as.character(clam_claim_id)
+    ) %>%
+    select(clam_cont, clam_source, clam_cycle_date, clam_claim_id, clam_code,
+           clam_status, clam_death_date, clam_death_reason,
+           clam_reported_date, clam_benefit_amt, clam_death_ben_amt,
+           clam_rider_code, clam_prem_refund_amt, clam_prem_past_due_amt, clam_rider_amt) %>%
+    distinct(clam_claim_id, .keep_all = TRUE) %>%
+    collect() %>%
+    left_join(., agent_name_role_lookup, by = c("clam_cont" = "Role_Contract_ID"),
+              relationship = "many-to-many") %>%
+    distinct(clam_claim_id, Role_Name_ID, .keep_all= TRUE)
+```
+
+```{r}
+cat("Loading annuity values...\n")
+log_message("Loading annuity values...")
+annv_v4 <- dplyr::tbl(aws.db, dbplyr::in_schema('edw_dl_se2','annuityvalues')) %>%
+    filter(annv_cont %in% !!contract_sample, annv_cycle_date >= !!cutoff_date) %>%
+    select(annv_cont, annv_cycle_date, annv_plan, annv_surr_chrg, annv_net_cv,
+           annv_db, annv_prem, annv_cytd_withd, annv_pytd_withd, annv_itd_withd,
+           annv_db_ratchet, annv_pytd_free_withd, annv_gmib, annv_gmdb,
+           annv_gwb, annv_mva, annv_surr_gtd_val) %>%
+    distinct(annv_cont, annv_cycle_date, .keep_all = TRUE) %>%
+    collect() %>%
+    left_join(., agent_name_role_lookup, by = c("annv_cont" = "Role_Contract_ID"),
+              relationship = "many-to-many") %>%
+    distinct(annv_cont, Role_Name_ID, .keep_all= TRUE)
+```
+
+```{r}
+cat("Loading life values...\n")
+log_message("Loading life values...")
+lifv_v4 <- dplyr::tbl(aws.db, dbplyr::in_schema('edw_dl_se2','lifevalues')) %>%
+    filter(lifv_cont %in% !!contract_sample, lifv_cycle_date >= !!cutoff_date) %>%
+    select(lifv_cont, lifv_source, lifv_cycle_date, lifv_plan, lifv_surr_chrg,
+           lifv_net_cv, lifv_db, lifv_nar, lifv_prem, lifv_cytd_prem, lifv_pytd_prem,
+           lifv_init_prem, lifv_cytd_withd, lifv_pytd_withd, lifv_itd_withd,
+           lifv_face_amt, lifv_prim_face, lifv_adb, lifv_annual_prem) %>%
+    distinct(lifv_cont, lifv_cycle_date, .keep_all = TRUE) %>%
+    collect() %>%
+    left_join(., agent_name_role_lookup, by = c("lifv_cont" = "Role_Contract_ID"),
+              relationship = "many-to-many") %>%
+    distinct(lifv_cont, Role_Name_ID, .keep_all= TRUE)
+```
+
+
+```{r}
+# Transform all datasets
+cat("Transforming data...\n")
+log_message("Transforming data...")
+
+transactions <- trans_v4 %>%
+    rename(Transaction_Number = tran_txn, Transaction_TPA = tran_source,
+           Transaction_Cycle_Date = tran_cycle_date, Transaction_Contract_Number = tran_cont,
+           Transaction_Fund_Name = tran_fund_name, Transaction_Code = tran_code,
+           Transaction_Type = tran_type, Transaction_Sub_Type = tran_sub_type,
+           Transaction_Detail_Type = tran_detail_type, Transaction_Effective_Date = tran_eff_date,
+           Transaction_Posted_Date = tran_posted_date, Transaction_Reversal_Date = tran_reversal_date,
+           Transaction_Total_Dollar_Amount = tran_tran_amt, Transaction_Total_Fund_Dollar_Amt = tran_fund_amt,
+           Transaction_Fund_Transaction_Amount = tran_fund_trans_amt, Transaction_Deposit_Date = tran_deposit_date,
+           Transaction_Fund_Initial_Deposit_Date = tran_init_dpst_date,
+           Transaction_Fund_Last_Deposit_Date = tran_last_dpst_date,
+           Transaction_UV_Basis_Points = tran_basis_points,
+           Transaction_Status_Code = tran_trans_status, Transaction_Interest_Rate = tran_int_rate
+    )
+```
+
+```{r}
+disbursements <- disb_v4 %>%
+    rename(Disbursement_Number = disb_disb,
+           Disbursement_TPA = disb_source, Disbursement_Cycle_Date = disb_cycle_date,
+           Disbursement_Contract_Number = disb_cont, Disbursement_Code = disb_disb_code,
+           Disbursement_Description = disb_disb_desc,
+           Disbursement_Date_Processed = disb_date,
+           Disbursement_Gross_Amount = disb_gross_amt, Disbursement_Net_Amount = disb_net_amt,
+           Disbursement_Name_ID = disb_nm_id, Disbursement_Federal_Tax_Withheld = disb_fed_tax,
+           Disbursement_State_Tax_Withheld = disb_state_tax,
+           Disbursement_State_Allowed = disb_state_allowed, Disbursement_Allocation_Percent = disb_alloc_perc
+    )
+```
+
+```{r}
+automated_activity <- aact_v4 %>%
+    rename(Activity_Contract_Number = aact_cont, Activity_TPA = aact_source,
+           Activity_Cycle_Date = aact_cycle_date, Activity_Type = aact_act_type,
+           Activity_Amount_Type = aact_amt_type,
+           Activity_Frequency = aact_freq, Activity_Amount = aact_act_amt,
+           Activity_Start_Date = aact_act_start, Activity_End_Date = aact_act_end,
+           Activity_Next_Transaction_Date = aact_next_trans_date, Activity_Status = aact_act_status,
+           Activity_Category = aact_amt_categ,
+           Activity_Transaction_End_Date = aact_trans_end_date,
+           Activity_Name_ID = aact_nm_id
+    )
+```
+
+```{r}
+policies <- poly_v4 %>%
+    rename(Policy_Contract_Number = poly_cont, Policy_TPA = poly_source,
+           Policy_Cycle_Date = poly_cycle_date, Policy_Contract_Company = poly_company,
+           Policy_Product_Description = poly_product,
+           Policy_Product_Type = poly_product_type, Policy_Status = poly_status,
+           Policy_Issue_Date = poly_issue_date, Policy_Maturity_Date = poly_mat_date,
+           Policy_Termination_Date = poly_term_date, Policy_Last_Transaction_Date = poly_lst_txn_date,
+           Policy_Issue_State = poly_issue_state, Policy_Issue_Age = poly_prim_issue_age,
+           Policy_Marital_Status = poly_marital_status, Policy_Billing_Amount = poly_planned_prem
+    )
+```
+
+```{r}
+claims <- clam_v4 %>%
+    rename(Claims_Contract_Number = clam_cont, Claims_TPA = clam_source,
+           Claims_Cycle_Date = clam_cycle_date, Claims_Claim_ID = clam_claim_id,
+           Claims_Code = clam_code, Claims_Status = clam_status,
+           Claims_Death_Date = clam_death_date, Claims_Death_Reason = clam_death_reason,
+           Claims_Reported_Date = clam_reported_date,
+           Claims_Benefit_Amount = clam_benefit_amt, Claims_Death_Benefit_Amount = clam_death_ben_amt,
+           Claims_Rider_Code = clam_rider_code, Claims_Premium_Refund_Amount = clam_prem_refund_amt,
+           Claims_Premium_Past_Due_Amount = clam_prem_past_due_amt, Claims_Rider_Amount = clam_rider_amt
+    )
+```
+
+```{r}
+life_values <- lifv_v4 %>%
+    rename(Life_Contract_Number = lifv_cont, Life_TPA = lifv_source,
+           Life_Cycle_Date = lifv_cycle_date, Life_Plan_Code = lifv_plan,
+           Life_Surrender_Charge = lifv_surr_chrg, Life_Net_Cash_Value = lifv_net_cv,
+           Life_Death_Benefit_Amount = lifv_db, Life_Net_Amount_At_Risk = lifv_nar,
+           Life_Inception_To_Date_Premiums = lifv_prem, Life_Current_YTD_Premiums = lifv_cytd_prem,
+           Life_YTD_Premiums_Since_Last_Anniversary = lifv_pytd_prem, Life_Initial_Premiums = lifv_init_prem,
+           Life_Current_YTD_Withdrawals = lifv_cytd_withd,
+           Life_YTD_Withdrawals_Since_Contract_Anniversary = lifv_pytd_withd,
+           Life_Inception_To_Date_Withdrawals = lifv_itd_withd,
+           Life_Face_Amount = lifv_face_amt, Life_Primary_Face_Amount = lifv_prim_face,
+           Life_ADB_Face_Amount = lifv_adb, Life_Annual_Premium = lifv_annual_prem
+    )
+```
+
+```{r}
+annuity_values <- annv_v4 %>%
+    rename(Annuity_Contract_ID = annv_cont, Annuity_Cycle_Date = annv_cycle_date,
+           Annuity_Plan_Code = annv_plan, Annuity_Surrender_Charge = annv_surr_chrg,
+           Annuity_Net_Cash_Value = annv_net_cv, Annuity_Death_Benefit_Amount = annv_db,
+           Annuity_Total_Premiums = annv_prem, Annuity_Current_YTD_Withdrawals = annv_cytd_withd,
+           Annuity_Prior_YTD_Withdrawals = annv_pytd_withd, Annuity_Total_Withdrawals = annv_itd_withd,
+           Annuity_Death_Benefit_Ratchet = annv_db_ratchet, Annuity_YTD_Free_Withdrawals = annv_pytd_free_withd,
+           Annuity_Guaranteed_Min_Income = annv_gmib,
+           Annuity_Guaranteed_Min_Death_Benefit = annv_gmdb, Annuity_Guaranteed_Withdrawal_Benefit = annv_gwb,
+           Annuity_Market_Value_Adjustment = annv_mva, Annuity_Guaranteed_Surrender_Value = annv_surr_gtd_val
+    )
+```
+
+```{r}
+# Clean up intermediate datasets
+rm(trans_v4, aact_v4, poly_v4, disb_v4, clam_v4, annv_v4, lifv_v4)
+gc()
+
+
+# Save data
+cat("Saving data...\n")
+# Save each dataset as separate parquet files
+write_parquet(transactions, file.path(CONFIG$output_path, paste0(CONFIG$data_file_prefix, "_transactions.parquet")))
+write_parquet(disbursements, file.path(CONFIG$output_path, paste0(CONFIG$data_file_prefix, "_disbursements.parquet")))
+write_parquet(claims, file.path(CONFIG$output_path, paste0(CONFIG$data_file_prefix, "_claims.parquet")))
+write_parquet(automated_activity, file.path(CONFIG$output_path, paste0(CONFIG$data_file_prefix, "_automated_activity.parquet")))
+write_parquet(policies, file.path(CONFIG$output_path, paste0(CONFIG$data_file_prefix, "_policies.parquet")))
+write_parquet(annuity_values, file.path(CONFIG$output_path, paste0(CONFIG$data_file_prefix, "_annuity_values.parquet")))
+write_parquet(life_values, file.path(CONFIG$output_path, paste0(CONFIG$data_file_prefix, "_life_values.parquet")))
+
+# Update timestamp
+writeLines(as.character(Sys.time()),
+           file.path(CONFIG$output_path, CONFIG$timestamp_file))
+
+cat("Data processing completed successfully!\n")
+log_message("Data processing completed successfully")
+```
+
+```{r}
+# Automation setup function
+setup_automation <- function() {
+    if (!require(cronR, quietly = TRUE)) {
+        install.packages("cronR")
+        library(cronR)
+    }
+
+    tryCatch(cron_rm(id = "zinnia_data_update"), error = function(e) {})
+
+    cron_add(
+        command = cron_rscript("~/rstudio/zin_qual_monitor_prototype/data_processor.R"),
+        frequency = "0 2 1 * *",
+        id = "zinnia_data_update",
+        description = "Zinnia TPA data monthly update"
+    )
+
+    cat("Automation scheduled successfully!\n")
+    cat("To check status: cron_ls()\n")
+    cat("To remove: cron_rm(id = 'zinnia_data_update')\n")
+}
+
+# Auto-execute when sourced (for testing)
+cat("Data processor loaded and executed.\n")
+```
