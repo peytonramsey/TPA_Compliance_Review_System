@@ -1,541 +1,1870 @@
----
-title: "zinnia_data_processing"
-output:
-  pdf_document: default
-  html_notebook: default
-editor_options:
-  chunk_output_type: inline
----
+# TPA Risk Monitoring - TPA Oversight Dashboard (Optimized)
 
-# Libraries
-```{r}
-library(tidyverse)
-library(AwsCloud)
+library(shiny)
+library(shinydashboard)
+library(DT)
 library(dplyr)
 library(lubridate)
+library(plotly)
+library(ggplot2)
+library(scales)
+library(purrr)
 library(arrow)
-```
 
-```{r}
-options(scipen = 999)
-```
+# DEMO APPLICATION NOTICE
+# This is an anonymized version of a real insurance oversight dashboard
+# All company names, proprietary systems, and business-specific details
+# have been replaced with generic equivalents for demonstration purposes
 
-```{r}
-var1 <- "/home/xigprst"
-source("~/.creds.R")
-aws.db <- aws_login_connect('edwprod00', passwdprod, 'prod')
-```
 
-```{r}
-# Configuration
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
 CONFIG <- list(
-    output_path = "~/rstudio/zin_qual_monitor_prototype/",
-    data_file_prefix = "zinnia_tpa_oversight",    
+    parquet_path = Sys.getenv("PARQUET_PATH", "reviews_data.parquet"),
+    correspondence_adhoc_parquet = "correspondence_adhoc_reviews.parquet",
+    data_file = Sys.getenv("DATA_FILE", "insurance_data.RData"),
     timestamp_file = "last_update.txt",
-    log_file = "data_processing.log"
+    default_high_threshold = as.numeric(Sys.getenv("HIGH_THRESHOLD", "100000")),
+    default_low_threshold = as.numeric(Sys.getenv("LOW_THRESHOLD", "100")),
+    default_checklist_total = 6,
+    quality_pass_threshold = 80,
+    data_refresh_hours = 24
 )
-```
 
-```{r}
-# Logging function
-log_message <- function(msg) {
-    timestamp <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
-    log_entry <- paste(timestamp, "-", msg)
-    cat(log_entry, "\n")
-    write(log_entry, file = file.path(CONFIG$output_path, CONFIG$log_file), append = TRUE)
+CHOICES <- list(
+    activity = c("All" = "all", "Transactions" = "transactions", "Disbursements" = "disbursements",
+                 "Claims" = "claims", "Automated Activity" = "automated_activity", "Policy Changes" = "policies",
+                 "Annuity Values" = "annuity_values", "Life Values" = "life_values"),
+    company = c("All" = "all", "Demo Life and Annuity Company" = "Demo Life and Annuity Company",
+                "Demo Life Insurance Company" = "Demo Life Insurance Company", "Demo Variable Insurance Company" = "Demo Variable Insurance Company"),
+    status = c("All" = "all", "Pending Review" = "Pending Review", "In Progress" = "In Progress", "Completed" = "Completed", "Flagged" = "Flagged")
+)
+
+# Consolidated checklist data
+CHECKLISTS <- list(
+    transactions = list(
+        transaction_validation = c(
+            "Verify transaction type, status, and date accuracy",
+            "Confirm account codes and sequence linkage",
+            "Review exchange requests and reconciliation"
+        ),
+        premium_loan_processing = c(
+            "Verify funds applied to correct policy/amount/date",
+            "Confirm loan processing and repayment accuracy",
+            "Validate planned vs unplanned premium designation"
+        ),
+        tax_compliance = c(
+            "Verify Tax reporting codes and Roth conversion setup",
+            "Validate distribution codes and cost basis updates"
+        )
+    ),
+    disbursements = list(
+        authorization_verification = c(
+            "Verify all required signatures and documentation",
+            "Confirm original Documentation/Notary for amounts with Dollar Risk",
+            "Check high dollar review completion"
+        ),
+        distribution_processing = c(
+            "Verify correct distribution code assignment",
+            "Confirm ACH information and ACH validation",
+            "Validate address verification requirements"
+        ),
+        amount_verification = c(
+            "Verify gross vs net amount caSystem platformulations",
+            "Confirm tax withholding and surrender charges",
+            "Validate linked transaction accuracy"
+        )
+    ),
+    claims = list(
+        death_verification = c("Verify Contract Number & owner/insured/annuitant",
+                               "Death certificate verification (verify DOD, DOB, & SS)", "Proofs in good order"
+        ),
+        beneficiary_payment = c("Verify beneficiary & check for assignments",
+                                "Verify State interest rate and int end date for payment"
+        ),
+        regulatory_compliance = c("Check/Compliance tracking (verify setup & accounting - affirmative states)"
+        )
+    ),
+    automated_activity = list(
+        setup_configuration = c(
+            "Verify systematic withdrawal/RMD setup on systems",
+            "Confirm caSystem platformulation type and withholding amounts",
+            "Check activity type, frequency, and dates"
+        ),
+        rmd_configuration = c(
+            "Verify year of first payment date matches first payment year",
+            "Confirm caSystem platformulation type and withholding amounts",
+            "Validate mode and disbursement type settings",
+            "Check RMD setup on RMD configuration screen and System scheduled transactions"
+        ),
+        processing_verification = c(
+            "Review next transaction date accuracy",
+            "Confirm activity status and regulatory compliance",
+            "Validate ACH validation info requirements (GIACT for ACH disbursements)",
+            "Check Tax reporting codes tax reporting verification (DC on F6)"
+        )
+    ),
+    policies = list(
+        application_forms = c(
+            "Verify form completion and required signatures",
+            "Confirm proper filing and state-specific requirements",
+            "Ensure conversion type and quote provision accuracy"
+        ),
+        quote_demographics = c(
+            "Match submitted amount with conversion quote",
+            "Verify face amount, age, rate class, gender, and owner/insured alignment",
+            "Validate modal premium, rider additions, and waiver activation"
+        ),
+        illustration_changes = c(
+            "Confirm correct rate and illustration matches transaction",
+            "Verify policy numbers, ages, and date consistency",
+            "Check death benefit options and proper forms usage"
+        )
+    ),
+    annuity_values = list(
+        annuitization_processing = c(
+            "Verify annuitization input/kept in System platform using original policy number",
+            "Confirm annuitization transaction has been processed",
+            "Validate information input properly in Annuitization Tab (Option/Dates/Mode/Amount)",
+            "Check Traditional ONLY template completion (all information)"
+        ),
+        value_caSystem platformulations = c(
+            "Verify annuity cash value accuracy and caSystem platformulations",
+            "Confirm surrender charge caSystem platformulations and penalty-free amounts",
+            "Validate premium amounts and fund allocations",
+            "Check guaranteed benefit amounts and death benefit processing"
+        ),
+        maturity_processing = c(
+            "Determine if request is maturity date extension",
+            "Verify date extension processing if applicable",
+            "Confirm maturity processing procedures",
+            "Review withdrawal amounts YTD/ITD tracking"
+        )
+    ),
+    life_values = list(
+        coverage_verification = c(
+            "Verify face amount accuracy and additional coverages",
+            "Confirm death benefit amount caSystem platformulations",
+            "Check life insurance cash value caSystem platformulations",
+            "Validate conversion type and quote provisions"
+        ),
+        premium_cash_value = c(
+            "Verify premium payment accuracy and modal amounts",
+            "Confirm loan processing and repayment accuracy",
+            "Check rider additions and waiver of premium activation",
+            "Validate policy dates and issue date consistency"
+        ),
+        policy_compliance = c(
+            "Verify rate class, gender, and age verification",
+            "Confirm ownership and beneficiary designations",
+            "Check state-specific requirements compliance",
+            "Validate policy number and insured information accuracy"
+        )
+    ),
+    titles = list(
+        universal_requirements = c("Verify form completion and proper signatures/dating",
+                                   "Confirm receipt of all required documentation",
+                                   "Update system per guidelines"
+        ),
+        beneficiary_owner_changes = c("Confirm beneficiary roles and percentages (100%)",
+                                      "Verify correct spelling and designations",
+                                      "Check state-specific execution requirements",
+                                      "Ensure confirmation letters sent"
+        ),
+        poa_legal_changes = c("Identify correct authorized parties",
+                              "Verify POA signed, notarized, and documentation complete",
+                              "Handle court documents per guidelines"
+        ),
+        claims_follow_up = c("Complete Incomplete correspondence and 30-day follow-up",
+                             "Verify signature requirements and disability guidelines"
+        )
+    ),
+    correspondence_adhoc = list(
+        correspondence = list(
+            documentation_review = c(
+                "Verify all required correspondence received",
+                "Confirm customer request is clear and complete",
+                "Check for proper authorization signatures"
+            ),
+            processing_validation = c(
+                "Validate correspondence processed per guidelines",
+                "Confirm system updates completed correctly",
+                "Verify outgoing response sent to customer"
+            )
+        ),
+        adhoc = list(
+            special_requests = c(
+                "Verify freelook or stop pay requests processed correctly",
+                "Confirm exception handling and supervisory approval",
+                "Check reissue processing for returned payments"
+            ),
+            transfer_processing = c(
+                "Verify outgoing transfer requirements (State regulation compliance if applicable)",
+                "Confirm all signatures and documentation complete",
+                "Validate tax implications and cost basis coordination"
+            )
+        ),
+        other = list(
+            general_review = c(
+                "Verify request type and processing requirements",
+                "Confirm all documentation and authorizations complete",
+                "Check system updates and customer communication"
+            )
+        )
+    )
+)
+
+CATEGORY_WEIGHTS <- list(
+    transactions = list(transaction_validation = 38, premium_loan_processing = 38, tax_compliance = 24),
+    disbursements = list(authorization_verification = 34, distribution_processing = 33, amount_verification = 33),
+    claims = list(death_verification = 50, beneficiary_payment = 33, regulatory_compliance = 17),
+    automated_activity = list(setup_configuration = 27, rmd_configuration = 37, processing_verification = 36),
+    policies = list(application_forms = 34, quote_demographics = 33, illustration_changes = 33),
+    annuity_values = list(annuitization_processing = 34, value_caSystem platformulations = 33, maturity_processing = 33),
+    life_values = list(coverage_verification = 34, premium_cash_value = 33, policy_compliance = 33),
+    titles = list(universal_requirements = 25, beneficiary_owner_changes = 33, poa_legal_changes = 25, claims_follow_up = 17),
+    correspondence_adhoc = list(outgoing_transfers = 25, tax_corrections = 25, special_requests = 20, representative_changes = 15, policy_restrictions = 15)
+)
+
+CATEGORY_DISPLAY_NAMES <- list(
+    transactions = c("Transaction Validation" = "transaction_validation", "Premium & Loan Processing" = "premium_loan_processing", "Tax Compliance" = "tax_compliance"),
+    disbursements = c("Authorization Verification" = "authorization_verification", "Distribution Processing" = "distribution_processing", "Amount Verification" = "amount_verification"),
+    claims = c("Death Verification" = "death_verification", "Beneficiary Payment" = "beneficiary_payment", "Regulatory Compliance" = "regulatory_compliance"),
+    automated_activity = c("Setup & Configuration" = "setup_configuration", "RMD Configuration" = "rmd_configuration", "Processing Verification" = "processing_verification"),
+    policies = c("Application & Forms" = "application_forms", "Quote & Demographics" = "quote_demographics", "Illustration & Changes" = "illustration_changes"),
+    annuity_values = c("Annuitization Processing" = "annuitization_processing", "Value CaSystem platformulations" = "value_caSystem platformulations", "Maturity Processing" = "maturity_processing"),
+    life_values = c("Coverage Verification" = "coverage_verification", "Premium & Cash Value" = "premium_cash_value", "Policy Compliance" = "policy_compliance"),
+    titles = c("Universal Requirements" = "universal_requirements", "Beneficiary & Owner Changes" = "beneficiary_owner_changes", "POA & Legal Changes" = "poa_legal_changes", "Claims & Follow-up" = "claims_follow_up"),
+    correspondence_adhoc = c("Outgoing Transfers" = "outgoing_transfers", "Tax Corrections" = "tax_corrections", "Special Requests" = "special_requests", "Representative Changes" = "representative_changes", "Policy Restrictions" = "policy_restrictions")
+)
+
+# Define column types for consistent formatting
+COLUMN_FORMATS <- list(
+    monetary = c(
+        "Transaction_Total_Dollar_Amount", "Transaction_Total_Fund_Dollar_Amt", "Transaction_Fund_Transaction_Amount",
+        "Disbursement_Gross_Amount", "Disbursement_Net_Amount", "Disbursement_Federal_Tax_Withheld", "Disbursement_State_Tax_Withheld",
+        "Claims_Benefit_Amount", "Claims_Death_Benefit_Amount", "Claims_Premium_Refund_Amount", "Claims_Premium_Past_Due_Amount", "Claims_Rider_Amount",
+        "Activity_Amount", "Policy_Billing_Amount",
+        "Life_Surrender_Charge", "Life_Net_Cash_Value", "Life_Death_Benefit_Amount", "Life_Net_Amount_At_Risk",
+        "Life_Inception_To_Date_Premiums", "Life_Current_YTD_Premiums", "Life_YTD_Premiums_Since_Last_Anniversary",
+        "Life_Initial_Premiums", "Life_Current_YTD_Withdrawals", "Life_YTD_Withdrawals_Since_Contract_Anniversary",
+        "Life_Inception_To_Date_Withdrawals", "Life_Face_Amount", "Life_Primary_Face_Amount", "Life_ADB_Face_Amount", "Life_Annual_Premium",
+        "Annuity_Surrender_Charge", "Annuity_Net_Cash_Value", "Annuity_Death_Benefit_Amount", "Annuity_Total_Premiums",
+        "Annuity_Current_YTD_Withdrawals", "Annuity_Prior_YTD_Withdrawals", "Annuity_Total_Withdrawals",
+        "Annuity_Death_Benefit_Ratchet", "Annuity_YTD_Free_Withdrawals", "Annuity_Guaranteed_Min_Income",
+        "Annuity_Guaranteed_Min_Death_Benefit", "Annuity_Guaranteed_Withdrawal_Benefit", "Annuity_Market_Value_Adjustment",
+        "Annuity_Guaranteed_Surrender_Value"
+    ),
+    percentage = c("Transaction_Interest_Rate", "Disbursement_Allocation_Percent", "Role_Allocation_Percent"),
+    basis_points = c("Transaction_UV_Basis_Points")
+)
+
+# Business rule validators
+is_valid_value <- function(value, field_type = "default") {
+    if (is.na(value) || is.null(value) || value == "") return(FALSE)
+
+    switch(field_type,
+           "date" = value != "2999-12-31",
+           "relationship" = value != -999,
+           "gender" = value != "unk",
+           TRUE
+    )
 }
-```
 
-```{r}
-# Replace everything from the function definition through the return statement
-create_full_lookup <- function(db_connection, contracts, cutoff_date) {
-    # Load roles for contracts
-    roles_raw <- dplyr::tbl(db_connection, dbplyr::in_schema('edw_dl_se2','roles')) %>%
-        filter(role_cont %in% !!contracts, role_cycle_date >= !!cutoff_date) %>%
-        select(role_cont, role_source, role_cycle_date, role_type,
-               role_nm_id, role_eff_date, role_end_date,
-               role_ext_id, role_rel_code, role_pct, role_rider_code,
-               role_coverage_num, role_rider_claim_date) %>%
-        distinct() %>%
-        collect()
-
-    # Get unique IDs for filtering
-    name_ids <- unique(roles_raw$role_nm_id)
-    external_ids <- unique(roles_raw$role_ext_id)
-
-    # Load names using %in% instead of semi_join
-    names_raw <- dplyr::tbl(db_connection, dbplyr::in_schema('edw_dl_se2','names')) %>%
-        filter(name_cycle_date >= !!cutoff_date, name_nm_id %in% !!name_ids) %>%
-        select(name_cycle_date, name_nm_id, name_name_type, name_fst_name,
-               name_lg_name, name_dob, name_gender, name_dod, name_email) %>%
-        distinct() %>%
-        collect()
-
-    # Load agents using %in% instead of semi_join
-    agents_raw <- dplyr::tbl(db_connection, dbplyr::in_schema('edw_dl_se2','agent')) %>%
-        filter(agnt_cycle_date >= !!cutoff_date, agnt_external_id %in% !!external_ids) %>%
-        select(agnt_source, agnt_cycle_date, agnt_external_id,
-               agnt_org_name, agnt_master_group_id) %>%
-        distinct() %>%
-        collect()
-
-    # Filter to latest records to avoid many-to-many joins
-    names_filtered <- names_raw %>%
-        group_by(name_nm_id) %>%
-        slice_max(name_cycle_date, n = 1, with_ties = FALSE) %>%
-        ungroup()
-
-    agents_filtered <- agents_raw %>%
-        group_by(agnt_external_id) %>%
-        slice_max(agnt_cycle_date, n = 1, with_ties = FALSE) %>%
-        ungroup()
-
-    # Combine with renamed columns
-    combined <- roles_raw %>%
-        rename(Role_Contract_ID = role_cont, Role_TPA = role_source,
-               Role_Cycle_Date = role_cycle_date, Role_Type = role_type,
-               Role_Name_ID = role_nm_id, Role_Effective_Date = role_eff_date,
-               Role_End_Date = role_end_date, Role_External_ID = role_ext_id,
-               Role_Relationship_Code = role_rel_code, Role_Allocation_Percent = role_pct,
-               Role_Coverage_ID = role_coverage_num, Role_Rider_Code = role_rider_code,
-               Role_Rider_Claim_Date = role_rider_claim_date) %>%
-        left_join(
-            names_filtered %>% rename(Name_Cycle_Date = name_cycle_date, Name_ID = name_nm_id, Name_Type = name_name_type,
-                                      Name_First_Name = name_fst_name, Name_Legal_Name = name_lg_name,
-                                      Name_DOB = name_dob, Name_Gender = name_gender,
-                                      Name_DOD = name_dod, Name_Email = name_email),
-            by = c("Role_Name_ID" = "Name_ID")
-        ) %>%
-        left_join(
-            agents_filtered %>% rename(Agent_TPA = agnt_source, Agent_Cycle_Date = agnt_cycle_date,
-                                       Agent_External_ID = agnt_external_id, Agent_Organization_Name = agnt_org_name,
-                                       Agent_Master_Group_ID = agnt_master_group_id),
-            by = c("Role_External_ID" = "Agent_External_ID")
-        ) %>%
-        # Remove duplicates where same person has multiple role types for same contract
-        group_by(Role_Contract_ID, Name_First_Name, Name_Legal_Name) %>%
-        slice_head(n = 1) %>%
-        ungroup() %>%
-        distinct(Role_Contract_ID, Role_Name_ID, Role_External_ID, Role_Type, .keep_all = TRUE)
-
-    return(combined)
+get_display_name <- function(first_name, legal_name, name_type) {
+    if (!is_valid_value(first_name) && is_valid_value(legal_name)) {
+        return(legal_name) # Company/org name
+    } else if (is_valid_value(first_name) && is_valid_value(legal_name)) {
+        return(paste(first_name, legal_name)) # Person name
+    }
+    return(NA)
 }
-```
 
-## Setup and Configuration
-```{r}
-cat("Starting data processing function...\n")
-log_message("Starting data processing")
+is_agent_role <- function(role_type) {
+    ifelse(is.na(role_type) | is.null(role_type) | role_type == "",
+           FALSE,
+           tolower(role_type) %in% c("serv rep", "comm rep"))
+}
 
-# Dynamic cutoff date
-cutoff_date <- floor_date(Sys.Date() - months(1), "month")
-cat("Using cutoff date:", as.character(cutoff_date), "\n")
-log_message(paste("Using cutoff date:", cutoff_date))
-```
+# =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
 
-```{r}
-# Sample contracts
-cat("Retrieving contract sample from all data sources...\n")
-# Get contracts from all data sources
-trans_contracts <- dplyr::tbl(aws.db, dbplyr::in_schema('edw_dl_se2','transactions')) %>%
-    filter(tran_cycle_date >= !!cutoff_date) %>%
-    mutate(month_year = floor_date(tran_cycle_date, "month")) %>%
-    group_by(month_year) %>%
-    slice_sample(n = 50) %>%
-    ungroup() %>%
-    select(tran_cont) %>%
-    distinct()
-```
+check_data_freshness <- function() {
+    if (!file.exists(CONFIG$timestamp_file)) return(FALSE)
+    last_update <- readLines(CONFIG$timestamp_file)[1]
+    last_update_time <- as.POSIXct(last_update)
+    hours_since_update <- as.numeric(difftime(Sys.time(), last_update_time, units = "hours"))
+    return(hours_since_update < CONFIG$data_refresh_hours)
+}
 
-```{r}
-aact_contracts <- dplyr::tbl(aws.db, dbplyr::in_schema('edw_dl_se2','automatedactivity')) %>%
-    filter(aact_cycle_date >= !!cutoff_date) %>%
-    mutate(month_year = floor_date(aact_cycle_date, "month")) %>%
-    group_by(month_year) %>%
-    slice_sample(n = 50) %>%
-    ungroup() %>%
-    select(aact_cont) %>%
-    rename(tran_cont = aact_cont) %>%
-    distinct()
-```
+load_data <- function() {
+    if (!exists("transactions") || !exists("disbursements") || !check_data_freshness()) {
+        if (file.exists(CONFIG$data_file)) {
+            load(CONFIG$data_file, envir = .GlobalEnv)
+            required_objects <- c("transactions", "disbursements", "claims", "automated_activity", "policies", "annuity_values", "life_values", "agent_name_role_lookup")
+            missing_objects <- required_objects[!sapply(required_objects, exists)]
+            if (length(missing_objects) > 0) stop("Missing required data objects: ", paste(missing_objects, collapse = ", "))
+        } else {
+            stop("Data file not found: ", CONFIG$data_file)
+        }
+    }
+}
 
-```{r}
-poly_contracts <- dplyr::tbl(aws.db, dbplyr::in_schema('edw_dl_se2','policy')) %>%
-    filter(poly_cycle_date >= !!cutoff_date) %>%
-    mutate(month_year = floor_date(poly_cycle_date, "month")) %>%
-    group_by(month_year) %>%
-    slice_sample(n = 50) %>%
-    ungroup() %>%
-    select(poly_cont) %>%
-    rename(tran_cont = poly_cont) %>%
-    distinct()
-```
+get_prior_month_range <- function(current_date = Sys.Date()) {
+    first_day_current <- floor_date(current_date, "month")
+    first_day_prior <- first_day_current - months(1)
+    last_day_prior <- ceiling_date(first_day_prior, "month") - days(1)
+    list(start = first_day_prior, end = last_day_prior)
+}
 
-```{r}
-disb_contracts <- dplyr::tbl(aws.db, dbplyr::in_schema('edw_dl_se2','disbursements')) %>%
-    filter(disb_cycle_date >= !!cutoff_date) %>%
-    mutate(month_year = floor_date(disb_cycle_date, "month")) %>%
-    group_by(month_year) %>%
-    slice_sample(n = 50) %>%
-    ungroup() %>%
-    select(disb_cont) %>%
-    rename(tran_cont = disb_cont) %>%
-    distinct()
-```
+generate_checklist_ui <- function(checklist_data, weights, input_prefix) {
+    if (is.null(checklist_data)) return(div("No checklist data available"))
 
-```{r}
-claims_contracts <- dplyr::tbl(aws.db, dbplyr::in_schema('edw_dl_se2','claims')) %>%
-    filter(clam_cycle_date >= !!cutoff_date) %>%
-    mutate(month_year = floor_date(clam_cycle_date, "month")) %>%
-    group_by(month_year) %>%
-    slice_sample(n = 50) %>%
-    ungroup() %>%
-    select(clam_cont) %>%
-    rename(tran_cont = clam_cont) %>%
-    distinct()
-```
+    category_ui <- list()
+    item_counter <- 0
 
-```{r}
-annuity_contracts <- dplyr::tbl(aws.db, dbplyr::in_schema('edw_dl_se2','annuityvalues')) %>%
-    filter(annv_cycle_date >= !!cutoff_date) %>%
-    mutate(month_year = floor_date(annv_cycle_date, "month")) %>%
-    group_by(month_year) %>%
-    slice_sample(n = 50) %>%
-    ungroup() %>%
-    select(annv_cont) %>%
-    rename(tran_cont = annv_cont) %>%
-    distinct()
-```
+    for (category in names(checklist_data)) {
+        items <- checklist_data[[category]]
+        category_weight <- weights[[category]]
+        display_category <- stringr::str_to_title(gsub("_", " ", category))
 
-```{r}
-life_contracts <- dplyr::tbl(aws.db, dbplyr::in_schema('edw_dl_se2','lifevalues')) %>%
-    filter(lifv_cycle_date >= !!cutoff_date) %>%
-    mutate(month_year = floor_date(lifv_cycle_date, "month")) %>%
-    group_by(month_year) %>%
-    slice_sample(n = 50) %>%
-    ungroup() %>%
-    select(lifv_cont) %>%
-    rename(tran_cont = lifv_cont) %>%
-    distinct()
-```
+        # Category header
+        category_ui <- append(category_ui, list(
+            h5(paste(display_category, "Items (", category_weight, "% of total score)"),
+               style = "color: #337ab7; margin-top: 20px;")
+        ))
 
-```{r}
-contract_sample <- unique(c(
-    trans_contracts %>% collect() %>% pull(tran_cont),
-    aact_contracts %>% collect() %>% pull(tran_cont),
-    poly_contracts %>% collect() %>% pull(tran_cont),
-    disb_contracts %>% collect() %>% pull(tran_cont),
-    claims_contracts %>% collect() %>% pull(tran_cont),
-    annuity_contracts %>% collect() %>% pull(tran_cont),
-    life_contracts %>% collect() %>% pull(tran_cont)
-))
+        # Category items
+        for (i in 1:length(items)) {
+            item_counter <- item_counter + 1
+            category_ui <- append(category_ui, list(
+                div(style = "margin-bottom: 8px; margin-left: 15px;",
+                    checkboxInput(paste0(input_prefix, item_counter), label = items[i], value = FALSE))
+            ))
+        }
+    }
+    div(category_ui, hr())
+}
 
-cat("Retrieved", length(contract_sample), "sample contracts from all data sources\n")
-log_message(paste("Retrieved", length(contract_sample), "sample contracts from all data sources"))
-```
-
-```{r}
-# Call the lookup function to create the data
-agent_name_role_lookup <- create_full_lookup(aws.db, contract_sample, cutoff_date)
-```
-
-```{r}
-cat("Loading agent-name-role lookup...\n")
-log_message("Loading agent-name-role lookup...")
-
-lookup_file <- file.path(CONFIG$output_path, "agent_name_role_lookup.parquet")
-write_parquet(agent_name_role_lookup, lookup_file)
-
-log_message("Created lookup file")
-```
-
-```{r}
-# Load all datasets
-cat("Loading transactions...\n")
-log_message("Loading transactions...")
-trans_v4 <- dplyr::tbl(aws.db, dbplyr::in_schema('edw_dl_se2','transactions')) %>%
-    filter(tran_cont %in% !!contract_sample, tran_cycle_date >= !!cutoff_date) %>%
-    mutate(
-        tran_txn = as.character(tran_txn)
-    ) %>%
-    select(tran_txn, tran_source,
-           tran_cycle_date, tran_cont, tran_fund_name, tran_code, tran_type,
-           tran_sub_type, tran_detail_type, tran_eff_date, tran_posted_date,
-           tran_reversal_date, tran_tran_amt, tran_fund_amt, tran_fund_trans_amt,
-           tran_deposit_date, tran_init_dpst_date, tran_last_dpst_date,
-           tran_basis_points, tran_trans_status,
-           tran_int_rate) %>%
-    distinct(tran_txn, .keep_all = TRUE) %>%
-    collect() %>%
-    left_join(., agent_name_role_lookup, by = c("tran_cont" = "Role_Contract_ID"),
-              relationship = "many-to-many") %>%
-    distinct(tran_txn, Role_Name_ID, Name_DOB, .keep_all= TRUE)
-```
-
-```{r}
-cat("Loading automated activity...\n")
-log_message("Loading automated activity...")
-aact_v4 <- dplyr::tbl(aws.db, dbplyr::in_schema('edw_dl_se2','automatedactivity')) %>%
-    filter(aact_cont %in% !!contract_sample, aact_cycle_date >= !!cutoff_date) %>%
-    mutate(
-        aact_nm_id = as.character(aact_nm_id)
-    ) %>%
-    select(aact_cont, aact_source, aact_cycle_date, aact_act_type, aact_amt_type,
-           aact_freq, aact_act_amt, aact_act_start, aact_act_end,
-           aact_next_trans_date, aact_act_status, aact_amt_categ,
-           aact_trans_end_date, aact_nm_id) %>%
-    distinct(aact_cont, aact_act_type, aact_act_start, .keep_all = TRUE) %>%
-    collect() %>%
-    left_join(., agent_name_role_lookup, by = c("aact_cont" = "Role_Contract_ID"),
-              relationship = "many-to-many") %>%
-    distinct(aact_cont, Role_Name_ID, .keep_all= TRUE)
-```
-
-```{r}
-cat("Loading policies...\n")
-log_message("Loading policies...")
-poly_v4 <- dplyr::tbl(aws.db, dbplyr::in_schema('edw_dl_se2','policy')) %>%
-    filter(poly_cont %in% !!contract_sample, poly_cycle_date >= !!cutoff_date) %>%
-    mutate(
-        poly_product_type = as.character(poly_product_type),
-        poly_lst_txn_num = as.character(poly_lst_txn_num)
-    ) %>%
-    select(poly_cont, poly_source, poly_cycle_date, poly_company,
-           poly_product, poly_product_type, poly_status, poly_issue_date,
-           poly_mat_date, poly_term_date, poly_lst_txn_date,
-           poly_issue_state, poly_prim_issue_age, poly_marital_status, poly_planned_prem
-    ) %>%
-    distinct(poly_cont, poly_cycle_date, .keep_all = TRUE) %>%
-    collect() %>%
-    left_join(., agent_name_role_lookup, by = c("poly_cont" = "Role_Contract_ID"),
-              relationship = "many-to-many") %>%
-    distinct(poly_cont, Role_Name_ID, .keep_all= TRUE)
-```
-
-```{r}
-cat("Loading disbursements...\n")
-log_message("Loading disbursements...")
-disb_v4 <- dplyr::tbl(aws.db, dbplyr::in_schema('edw_dl_se2','disbursements')) %>%
-    filter(disb_cont %in% !!contract_sample, disb_cycle_date >= !!cutoff_date) %>%
-    mutate(
-        disb_disb = as.character(disb_disb),
-        disb_nm_id = as.character(disb_nm_id)
-    ) %>%
-    select(disb_disb, disb_source, disb_cycle_date, disb_cont,
-           disb_disb_code, disb_disb_desc, disb_date,
-           disb_gross_amt, disb_net_amt, disb_nm_id,
-           disb_fed_tax, disb_state_tax, disb_state_allowed, disb_alloc_perc) %>%
-    distinct(disb_disb, .keep_all = TRUE) %>%
-    collect() %>%
-    left_join(., agent_name_role_lookup, by = c("disb_cont" = "Role_Contract_ID"),
-              relationship = "many-to-many") %>%
-    distinct(disb_disb, Role_Name_ID, .keep_all= TRUE)
-```
-
-```{r}
-cat("Loading claims...\n")
-log_message("Loading claims...")
-clam_v4 <- dplyr::tbl(aws.db, dbplyr::in_schema('edw_dl_se2','claims')) %>%
-    filter(clam_cont %in% !!contract_sample, clam_cycle_date >= !!cutoff_date) %>%
-    mutate(
-        clam_claim_id = as.character(clam_claim_id)
-    ) %>%
-    select(clam_cont, clam_source, clam_cycle_date, clam_claim_id, clam_code,
-           clam_status, clam_death_date, clam_death_reason,
-           clam_reported_date, clam_benefit_amt, clam_death_ben_amt,
-           clam_rider_code, clam_prem_refund_amt, clam_prem_past_due_amt, clam_rider_amt) %>%
-    distinct(clam_claim_id, .keep_all = TRUE) %>%
-    collect() %>%
-    left_join(., agent_name_role_lookup, by = c("clam_cont" = "Role_Contract_ID"),
-              relationship = "many-to-many") %>%
-    distinct(clam_claim_id, Role_Name_ID, .keep_all= TRUE)
-```
-
-```{r}
-cat("Loading annuity values...\n")
-log_message("Loading annuity values...")
-annv_v4 <- dplyr::tbl(aws.db, dbplyr::in_schema('edw_dl_se2','annuityvalues')) %>%
-    filter(annv_cont %in% !!contract_sample, annv_cycle_date >= !!cutoff_date) %>%
-    select(annv_cont, annv_cycle_date, annv_plan, annv_surr_chrg, annv_net_cv,
-           annv_db, annv_prem, annv_cytd_withd, annv_pytd_withd, annv_itd_withd,
-           annv_db_ratchet, annv_pytd_free_withd, annv_gmib, annv_gmdb,
-           annv_gwb, annv_mva, annv_surr_gtd_val) %>%
-    distinct(annv_cont, annv_cycle_date, .keep_all = TRUE) %>%
-    collect() %>%
-    left_join(., agent_name_role_lookup, by = c("annv_cont" = "Role_Contract_ID"),
-              relationship = "many-to-many") %>%
-    distinct(annv_cont, Role_Name_ID, .keep_all= TRUE)
-```
-
-```{r}
-cat("Loading life values...\n")
-log_message("Loading life values...")
-lifv_v4 <- dplyr::tbl(aws.db, dbplyr::in_schema('edw_dl_se2','lifevalues')) %>%
-    filter(lifv_cont %in% !!contract_sample, lifv_cycle_date >= !!cutoff_date) %>%
-    select(lifv_cont, lifv_source, lifv_cycle_date, lifv_plan, lifv_surr_chrg,
-           lifv_net_cv, lifv_db, lifv_nar, lifv_prem, lifv_cytd_prem, lifv_pytd_prem,
-           lifv_init_prem, lifv_cytd_withd, lifv_pytd_withd, lifv_itd_withd,
-           lifv_face_amt, lifv_prim_face, lifv_adb, lifv_annual_prem) %>%
-    distinct(lifv_cont, lifv_cycle_date, .keep_all = TRUE) %>%
-    collect() %>%
-    left_join(., agent_name_role_lookup, by = c("lifv_cont" = "Role_Contract_ID"),
-              relationship = "many-to-many") %>%
-    distinct(lifv_cont, Role_Name_ID, .keep_all= TRUE)
-```
+reset_checkboxes <- function(session, prefix, count) {
+    for (i in 1:count) {
+        updateCheckboxInput(session, paste0(prefix, i), value = FALSE)
+    }
+}
 
 
-```{r}
-# Transform all datasets
-cat("Transforming data...\n")
-log_message("Transforming data...")
+create_select_inputs <- function(input_configs) {
+    map(input_configs, function(config) {
+        do.call(selectInput, config)
+    })
+}
 
-transactions <- trans_v4 %>%
-    rename(Transaction_Number = tran_txn, Transaction_TPA = tran_source,
-           Transaction_Cycle_Date = tran_cycle_date, Transaction_Contract_Number = tran_cont,
-           Transaction_Fund_Name = tran_fund_name, Transaction_Code = tran_code,
-           Transaction_Type = tran_type, Transaction_Sub_Type = tran_sub_type,
-           Transaction_Detail_Type = tran_detail_type, Transaction_Effective_Date = tran_eff_date,
-           Transaction_Posted_Date = tran_posted_date, Transaction_Reversal_Date = tran_reversal_date,
-           Transaction_Total_Dollar_Amount = tran_tran_amt, Transaction_Total_Fund_Dollar_Amt = tran_fund_amt,
-           Transaction_Fund_Transaction_Amount = tran_fund_trans_amt, Transaction_Deposit_Date = tran_deposit_date,
-           Transaction_Fund_Initial_Deposit_Date = tran_init_dpst_date,
-           Transaction_Fund_Last_Deposit_Date = tran_last_dpst_date,
-           Transaction_UV_Basis_Points = tran_basis_points,
-           Transaction_Status_Code = tran_trans_status, Transaction_Interest_Rate = tran_int_rate
-    )
-```
-
-```{r}
-disbursements <- disb_v4 %>%
-    rename(Disbursement_Number = disb_disb,
-           Disbursement_TPA = disb_source, Disbursement_Cycle_Date = disb_cycle_date,
-           Disbursement_Contract_Number = disb_cont, Disbursement_Code = disb_disb_code,
-           Disbursement_Description = disb_disb_desc,
-           Disbursement_Date_Processed = disb_date,
-           Disbursement_Gross_Amount = disb_gross_amt, Disbursement_Net_Amount = disb_net_amt,
-           Disbursement_Name_ID = disb_nm_id, Disbursement_Federal_Tax_Withheld = disb_fed_tax,
-           Disbursement_State_Tax_Withheld = disb_state_tax,
-           Disbursement_State_Allowed = disb_state_allowed, Disbursement_Allocation_Percent = disb_alloc_perc
-    )
-```
-
-```{r}
-automated_activity <- aact_v4 %>%
-    rename(Activity_Contract_Number = aact_cont, Activity_TPA = aact_source,
-           Activity_Cycle_Date = aact_cycle_date, Activity_Type = aact_act_type,
-           Activity_Amount_Type = aact_amt_type,
-           Activity_Frequency = aact_freq, Activity_Amount = aact_act_amt,
-           Activity_Start_Date = aact_act_start, Activity_End_Date = aact_act_end,
-           Activity_Next_Transaction_Date = aact_next_trans_date, Activity_Status = aact_act_status,
-           Activity_Category = aact_amt_categ,
-           Activity_Transaction_End_Date = aact_trans_end_date,
-           Activity_Name_ID = aact_nm_id
-    )
-```
-
-```{r}
-policies <- poly_v4 %>%
-    rename(Policy_Contract_Number = poly_cont, Policy_TPA = poly_source,
-           Policy_Cycle_Date = poly_cycle_date, Policy_Contract_Company = poly_company,
-           Policy_Product_Description = poly_product,
-           Policy_Product_Type = poly_product_type, Policy_Status = poly_status,
-           Policy_Issue_Date = poly_issue_date, Policy_Maturity_Date = poly_mat_date,
-           Policy_Termination_Date = poly_term_date, Policy_Last_Transaction_Date = poly_lst_txn_date,
-           Policy_Issue_State = poly_issue_state, Policy_Issue_Age = poly_prim_issue_age,
-           Policy_Marital_Status = poly_marital_status, Policy_Billing_Amount = poly_planned_prem
-    )
-```
-
-```{r}
-claims <- clam_v4 %>%
-    rename(Claims_Contract_Number = clam_cont, Claims_TPA = clam_source,
-           Claims_Cycle_Date = clam_cycle_date, Claims_Claim_ID = clam_claim_id,
-           Claims_Code = clam_code, Claims_Status = clam_status,
-           Claims_Death_Date = clam_death_date, Claims_Death_Reason = clam_death_reason,
-           Claims_Reported_Date = clam_reported_date,
-           Claims_Benefit_Amount = clam_benefit_amt, Claims_Death_Benefit_Amount = clam_death_ben_amt,
-           Claims_Rider_Code = clam_rider_code, Claims_Premium_Refund_Amount = clam_prem_refund_amt,
-           Claims_Premium_Past_Due_Amount = clam_prem_past_due_amt, Claims_Rider_Amount = clam_rider_amt
-    )
-```
-
-```{r}
-life_values <- lifv_v4 %>%
-    rename(Life_Contract_Number = lifv_cont, Life_TPA = lifv_source,
-           Life_Cycle_Date = lifv_cycle_date, Life_Plan_Code = lifv_plan,
-           Life_Surrender_Charge = lifv_surr_chrg, Life_Net_Cash_Value = lifv_net_cv,
-           Life_Death_Benefit_Amount = lifv_db, Life_Net_Amount_At_Risk = lifv_nar,
-           Life_Inception_To_Date_Premiums = lifv_prem, Life_Current_YTD_Premiums = lifv_cytd_prem,
-           Life_YTD_Premiums_Since_Last_Anniversary = lifv_pytd_prem, Life_Initial_Premiums = lifv_init_prem,
-           Life_Current_YTD_Withdrawals = lifv_cytd_withd,
-           Life_YTD_Withdrawals_Since_Contract_Anniversary = lifv_pytd_withd,
-           Life_Inception_To_Date_Withdrawals = lifv_itd_withd,
-           Life_Face_Amount = lifv_face_amt, Life_Primary_Face_Amount = lifv_prim_face,
-           Life_ADB_Face_Amount = lifv_adb, Life_Annual_Premium = lifv_annual_prem
-    )
-```
-
-```{r}
-annuity_values <- annv_v4 %>%
-    rename(Annuity_Contract_ID = annv_cont, Annuity_Cycle_Date = annv_cycle_date,
-           Annuity_Plan_Code = annv_plan, Annuity_Surrender_Charge = annv_surr_chrg,
-           Annuity_Net_Cash_Value = annv_net_cv, Annuity_Death_Benefit_Amount = annv_db,
-           Annuity_Total_Premiums = annv_prem, Annuity_Current_YTD_Withdrawals = annv_cytd_withd,
-           Annuity_Prior_YTD_Withdrawals = annv_pytd_withd, Annuity_Total_Withdrawals = annv_itd_withd,
-           Annuity_Death_Benefit_Ratchet = annv_db_ratchet, Annuity_YTD_Free_Withdrawals = annv_pytd_free_withd,
-           Annuity_Guaranteed_Min_Income = annv_gmib,
-           Annuity_Guaranteed_Min_Death_Benefit = annv_gmdb, Annuity_Guaranteed_Withdrawal_Benefit = annv_gwb,
-           Annuity_Market_Value_Adjustment = annv_mva, Annuity_Guaranteed_Surrender_Value = annv_surr_gtd_val
-    )
-```
-
-```{r}
-# Clean up intermediate datasets
-rm(trans_v4, aact_v4, poly_v4, disb_v4, clam_v4, annv_v4, lifv_v4)
-gc()
-
-
-# Save data
-cat("Saving data...\n")
-# Save each dataset as separate parquet files
-write_parquet(transactions, file.path(CONFIG$output_path, paste0(CONFIG$data_file_prefix, "_transactions.parquet")))
-write_parquet(disbursements, file.path(CONFIG$output_path, paste0(CONFIG$data_file_prefix, "_disbursements.parquet")))
-write_parquet(claims, file.path(CONFIG$output_path, paste0(CONFIG$data_file_prefix, "_claims.parquet")))
-write_parquet(automated_activity, file.path(CONFIG$output_path, paste0(CONFIG$data_file_prefix, "_automated_activity.parquet")))
-write_parquet(policies, file.path(CONFIG$output_path, paste0(CONFIG$data_file_prefix, "_policies.parquet")))
-write_parquet(annuity_values, file.path(CONFIG$output_path, paste0(CONFIG$data_file_prefix, "_annuity_values.parquet")))
-write_parquet(life_values, file.path(CONFIG$output_path, paste0(CONFIG$data_file_prefix, "_life_values.parquet")))
-
-# Update timestamp
-writeLines(as.character(Sys.time()),
-           file.path(CONFIG$output_path, CONFIG$timestamp_file))
-
-cat("Data processing completed successfully!\n")
-log_message("Data processing completed successfully")
-```
-
-```{r}
-# Automation setup function
-setup_automation <- function() {
-    if (!require(cronR, quietly = TRUE)) {
-        install.packages("cronR")
-        library(cronR)
+# Unified data processing
+create_full_activity_data <- function() {
+    # Standardized processing for all activity types
+    process_activity <- function(data, id_col, contract_col, date_col, type) {
+        data %>%
+            arrange(desc(!!sym(date_col))) %>%
+            distinct(!!sym(id_col), .keep_all = TRUE) %>%
+            mutate(
+                activity_type = type,
+                original_id = as.character(!!sym(id_col)),
+                contract_id = !!sym(contract_col),
+                cycle_date = !!sym(date_col)
+            ) %>%
+            select(contract_id, cycle_date, activity_type, original_id)
     }
 
-    tryCatch(cron_rm(id = "zinnia_data_update"), error = function(e) {})
-
-    cron_add(
-        command = cron_rscript("~/rstudio/zin_qual_monitor_prototype/data_processor.R"),
-        frequency = "0 2 1 * *",
-        id = "zinnia_data_update",
-        description = "Zinnia TPA data monthly update"
+    bind_rows(
+        process_activity(transactions, "Transaction_Number", "Transaction_Contract_Number", "Transaction_Cycle_Date", "transactions"),
+        process_activity(disbursements, "Disbursement_Number", "Disbursement_Contract_Number", "Disbursement_Cycle_Date", "disbursements"),
+        claims %>%
+            mutate(
+                activity_type = "claims",
+                original_id = as.character(Claims_Claim_ID),
+                contract_id = Claims_Contract_Number,
+                cycle_date = Claims_Cycle_Date
+            ) %>%
+            select(contract_id, cycle_date, activity_type, original_id),
+        automated_activity %>% mutate(combined_id = paste(Activity_Contract_Number, row_number(), sep = "_")) %>%
+            process_activity("combined_id", "Activity_Contract_Number", "Activity_Cycle_Date", "automated_activity"),
+        process_activity(policies, "Policy_Contract_Number", "Policy_Contract_Number", "Policy_Cycle_Date", "policies"),
+        annuity_values %>% mutate(temp_id = row_number()) %>%
+            process_activity("temp_id", "Annuity_Contract_ID", "Annuity_Cycle_Date", "annuity_values"),
+        life_values %>% mutate(temp_id = row_number()) %>%
+            process_activity("temp_id", "Life_Contract_Number", "Life_Cycle_Date", "life_values")
     )
-
-    cat("Automation scheduled successfully!\n")
-    cat("To check status: cron_ls()\n")
-    cat("To remove: cron_rm(id = 'zinnia_data_update')\n")
 }
 
-# Auto-execute when sourced (for testing)
-cat("Data processor loaded and executed.\n")
-```
+# Unified amount processing
+add_dollar_amounts <- function(data, high_threshold, low_threshold) {
+    amount_lookups <- list(
+        transactions = transactions %>% distinct(Transaction_Number, .keep_all = TRUE) %>%
+            select(original_id = Transaction_Number, amount = Transaction_Total_Dollar_Amount) %>%
+            mutate(original_id = as.character(original_id), activity_type = "transactions") %>%
+            distinct(original_id, activity_type, .keep_all = TRUE),
+
+        disbursements = disbursements %>% distinct(Disbursement_Number, .keep_all = TRUE) %>%
+            select(original_id = Disbursement_Number, amount = Disbursement_Gross_Amount) %>%
+            mutate(original_id = as.character(original_id), activity_type = "disbursements") %>%
+            distinct(original_id, activity_type, .keep_all = TRUE),
+
+        claims = claims %>% distinct(Claims_Claim_ID, .keep_all = TRUE) %>%
+            select(original_id = Claims_Claim_ID, amount = Claims_Benefit_Amount) %>%
+            mutate(original_id = as.character(original_id), activity_type = "claims") %>%
+            distinct(original_id, activity_type, .keep_all = TRUE),
+
+        automated_activity = automated_activity %>%
+            mutate(original_id = paste(Activity_Contract_Number, row_number(), sep = "_")) %>%
+            distinct(original_id, .keep_all = TRUE) %>%
+            select(original_id, amount = Activity_Amount) %>%
+            mutate(activity_type = "automated_activity"),
+
+        annuity_values = annuity_values %>% mutate(temp_id = row_number()) %>%
+            select(original_id = temp_id, amount = Annuity_Net_Cash_Value) %>%
+            mutate(original_id = as.character(original_id), activity_type = "annuity_values") %>%
+            distinct(original_id, activity_type, .keep_all = TRUE),
+
+        life_values = life_values %>% mutate(temp_id = row_number()) %>%
+            select(original_id = temp_id, amount = Life_Face_Amount) %>%
+            mutate(original_id = as.character(original_id), activity_type = "life_values") %>%
+            distinct(original_id, activity_type, .keep_all = TRUE)
+    )
+
+    all_amounts <- bind_rows(amount_lookups)
+
+    data %>%
+        left_join(all_amounts, by = c("original_id", "activity_type")) %>%
+        mutate(
+            amount = coalesce(amount, 0),
+            dollar_risk = case_when(
+                amount >= high_threshold ~ "High Dollar",
+                amount <= low_threshold & amount > 0 ~ "Low Dollar",
+                TRUE ~ "Normal"
+            )
+        )
+}
+
+format_dt_table <- function(dt_table, data) {
+    monetary_cols <- intersect(names(data), COLUMN_FORMATS$monetary)
+    percentage_cols <- intersect(names(data), COLUMN_FORMATS$percentage)
+    basis_points_cols <- intersect(names(data), COLUMN_FORMATS$basis_points)
+
+    if (length(monetary_cols) > 0) {
+        dt_table <- dt_table %>% formatCurrency(monetary_cols, currency = "$", digits = 2)
+    }
+    if (length(percentage_cols) > 0) {
+        # Simply add % suffix - values already correct
+        dt_table <- dt_table %>% formatString(percentage_cols, suffix = "%")
+    }
+    if (length(basis_points_cols) > 0) {
+        dt_table <- dt_table %>% formatRound(basis_points_cols, digits = 0, mark = ",")
+    }
+    return(dt_table)
+}
+
+# Unified parquet operations
+initialize_parquet <- function(parquet_path, extra_cols = NULL) {
+    if (!file.exists(parquet_path)) {
+        base_cols <- data.frame(
+            contract_id = character(0), activity_type = character(0), original_id = character(0),
+            cycle_date = as.Date(character(0)), review_status = character(0), quality_score = numeric(0),
+            checklist_completed = integer(0), checklist_total = integer(0), quality_pass = logical(0),
+            review_notes = character(0), follow_up_actions = character(0), reviewed_by = character(0),
+            review_date = as.Date(character(0)), review_mode = character(0), regulatory_score = numeric(0),
+            financial_score = numeric(0), process_score = numeric(0), category_scores = character(0),
+            stringsAsFactors = FALSE
+        )
+        if (!is.null(extra_cols)) base_cols <- cbind(base_cols, extra_cols)
+        write_parquet(base_cols, parquet_path)
+        return(base_cols)
+    }
+    read_parquet(parquet_path)
+}
+
+load_saved_reviews <- function(parquet_path = CONFIG$parquet_path) {
+    data <- initialize_parquet(parquet_path)
+    if (nrow(data) > 0) {
+        data$cycle_date <- as.Date(data$cycle_date)
+        data$review_date <- as.Date(data$review_date)
+        data$quality_pass <- as.logical(data$quality_pass)
+    }
+    data
+}
+
+save_review_to_parquet <- function(review_data, parquet_path = CONFIG$parquet_path) {
+    existing_data <- load_saved_reviews(parquet_path)
+    review_key <- paste(review_data$contract_id, review_data$activity_type, review_data$original_id, sep = "_")
+    existing_keys <- paste(existing_data$contract_id, existing_data$activity_type, existing_data$original_id, sep = "_")
+
+    if (review_key %in% existing_keys) {
+        existing_data[which(existing_keys == review_key), ] <- review_data
+    } else {
+        existing_data <- rbind(existing_data, review_data)
+    }
+    write_parquet(existing_data, parquet_path)
+    existing_data
+}
+
+merge_activity_with_reviews <- function(activity_data, saved_reviews) {
+    if (nrow(saved_reviews) == 0) {
+        return(activity_data %>%
+                   mutate(review_status = "Pending Review", quality_score = NA_real_,
+                          checklist_completed = NA_integer_, checklist_total = CONFIG$default_checklist_total,
+                          quality_pass = FALSE, review_notes = "", follow_up_actions = "",
+                          reviewed_by = "", review_date = as.Date(NA), review_mode = "activity",
+                          regulatory_score = NA_real_, financial_score = NA_real_, process_score = NA_real_))
+    }
+
+    activity_data %>%
+        left_join(saved_reviews %>% select(-cycle_date), by = c("contract_id", "activity_type", "original_id")) %>%
+        mutate(
+            review_status = coalesce(review_status, "Pending Review"),
+            quality_score = coalesce(quality_score, NA_real_),
+            checklist_completed = coalesce(checklist_completed, NA_integer_),
+            checklist_total = coalesce(checklist_total, CONFIG$default_checklist_total),
+            quality_pass = coalesce(quality_pass, FALSE),
+            review_notes = coalesce(review_notes, ""),
+            follow_up_actions = coalesce(follow_up_actions, ""),
+            reviewed_by = coalesce(reviewed_by, ""),
+            review_date = coalesce(review_date, as.Date(NA)),
+            review_mode = coalesce(review_mode, "activity"),
+            regulatory_score = coalesce(regulatory_score, NA_real_),
+            financial_score = coalesce(financial_score, NA_real_),
+            process_score = coalesce(process_score, NA_real_)
+        )
+}
+
+
+# Add after the merge_activity_with_reviews function
+get_contract_parties <- function(contract_id) {
+    contract_roles <- agent_name_role_lookup %>%
+        filter(Role_Contract_ID == contract_id) %>%
+        mutate(
+            display_name = case_when(
+                !is.na(Name_First_Name) & !is.na(Name_Legal_Name) &
+                    Name_First_Name != "" & Name_Legal_Name != "" ~
+                    paste(Name_First_Name, Name_Legal_Name),
+                !is.na(Name_Legal_Name) & Name_Legal_Name != "" ~ Name_Legal_Name,
+                TRUE ~ paste("ID:", Role_Name_ID)
+            ),
+            party_type = case_when(
+                grepl("OWN", Role_Type, ignore.case = TRUE) ~ "Owner",
+                grepl("AGENT|PRODUCER", Role_Type, ignore.case = TRUE) ~ "Agent",
+                TRUE ~ "Other"
+            ),
+            age = ifelse(!is.na(Name_DOB),
+                         as.numeric(difftime(Sys.Date(), as.Date(Name_DOB), units = "days")) %/% 365.25,
+                         NA)
+        )
+    return(contract_roles)
+}
+
+# Unified scoring system
+caSystem platformulate_unified_score <- function(input_prefix, activity_type, input_list) {
+    checklist_data <- CHECKLISTS[[activity_type]] %||% CHECKLISTS$default
+    weights <- CATEGORY_WEIGHTS[[activity_type]] %||% CATEGORY_WEIGHTS$default
+
+    item_counter <- 0
+    category_scores <- list()
+    category_details <- list()
+
+    for (category in names(checklist_data)) {
+        items <- checklist_data[[category]]
+        category_checked <- 0
+
+        for (i in 1:length(items)) {
+            item_counter <- item_counter + 1
+            if (!is.null(input_list[[paste0(input_prefix, item_counter)]]) &&
+                input_list[[paste0(input_prefix, item_counter)]]) {
+                category_checked <- category_checked + 1
+            }
+        }
+
+        category_pct <- if (length(items) > 0) (category_checked / length(items)) * 100 else 0
+        category_weighted_score <- (category_pct * weights[[category]]) / 100
+
+        category_scores[[category]] <- category_weighted_score
+        category_details[[category]] <- list(checked = category_checked, total = length(items), percentage = round(category_pct, 1))
+    }
+
+    total_score <- round(sum(unlist(category_scores)), 1)
+    pass_status <- total_score >= CONFIG$quality_pass_threshold
+
+    list(score = total_score, checked = sum(sapply(category_details, function(x) x$checked)),
+         total = sum(sapply(category_details, function(x) x$total)), pass = pass_status,
+         category_details = category_details, category_scores = category_scores)
+}
+
+# =============================================================================
+# UI HELPERS
+# =============================================================================
+
+create_value_box_row <- function(box_outputs) {
+    fluidRow(map(box_outputs, ~ valueBoxOutput(.x)))
+}
+
+create_standard_box <- function(title, content, status = "primary", width = 12) {
+    box(title = title, status = status, solidHeader = TRUE, width = width, content)
+}
+
+create_sidebar <- function() {
+    dashboardSidebar(
+        sidebarMenu(
+            menuItem("Dashboard", tabName = "dashboard", icon = icon("dashboard")),
+            menuItem("Contract Details", tabName = "details", icon = icon("search")),
+            menuItem("Risk Monitoring", tabName = "risk", icon = icon("chart-line")),
+            menuItem("Executive Summary", tabName = "summary", icon = icon("file-text")),
+            menuItem("Review History", tabName = "history", icon = icon("history")),
+            menuItem("Correspondence & Ad Hoc", tabName = "correspondence_adhoc", icon = icon("edit"))
+        ),
+        hr(),
+        h4("Monthly Filters", style = "padding-left: 15px;"),
+        fluidRow(column(12, style = "padding-left: 15px; padding-right: 15px;",
+                        div(style = "display: flex; align-items: center; margin-bottom: 10px;",
+                            actionButton("prev_month", "", icon = icon("chevron-left"), style = "margin-right: 5px;"),
+                            textOutput("current_month_display", inline = TRUE),
+                            actionButton("next_month", "", icon = icon("chevron-right"), style = "margin-left: 5px;")))),
+        textInput("contract_search", "Contract Search:", placeholder = "Enter contract ID"),
+        selectInput("activity_type", "Activity Type:", choices = CHOICES$activity, selected = "all"),
+        selectInput("poly_company", "Insurance Company:", choices = CHOICES$company, selected = "all"),
+        selectInput("review_status_filter", "Review Status:", choices = CHOICES$status, selected = "all"),
+        numericInput("high_dollar_threshold", "High Dollar Threshold ($):", value = CONFIG$default_high_threshold, min = 1000, step = 10000),
+        numericInput("low_dollar_threshold", "Low Dollar Threshold ($):", value = CONFIG$default_low_threshold, min = 1, step = 50),
+        checkboxInput("show_dollar_risks_only", "Show Dollar Risk Items Only", value = FALSE),
+        hr(),
+        h5("Amount Filters", style = "padding-left: 15px;"),
+        fluidRow(column(12, style = "padding-left: 15px; padding-right: 15px;",
+                        numericInput("min_amount", "Minimum Amount ($):", value = NULL, min = 0, step = 1000),
+                        numericInput("max_amount", "Maximum Amount ($):", value = NULL, min = 0, step = 1000),
+                        checkboxInput("exclude_zero_amounts", "Exclude $0 Amounts", value = FALSE)
+        )),
+        actionButton("apply_filters", "Apply Filters", class = "btn-primary", style = "margin: 10px 15px;")
+    )
+}
+
+
+# =============================================================================
+# UI DEFINITION
+# =============================================================================
+
+ui <- dashboardPage(
+    dashboardHeader(title = "Insurance Oversight"),
+    create_sidebar(),
+    dashboardBody(
+        tabItems(
+            # Dashboard Tab
+            tabItem(tabName = "dashboard",
+                    create_value_box_row(c("total_items", "pending_items", "completed_items", "in_progress_items", "flagged_items", "dollar_risk_items")),
+                    fluidRow(create_standard_box(textOutput("monthly_title"), DT::dataTableOutput("monthly_review_table")))),
+
+            # Summary Tab
+            tabItem(tabName = "summary",
+                    fluidRow(valueBoxOutput("summary_overall_score")),
+                    fluidRow(
+                        create_standard_box("Overall Performance Summary", uiOutput("overall_performance_summary"), "primary", 6),
+                        create_standard_box("Current Status", uiOutput("current_status_summary"), "info", 6)
+                    ),
+                    fluidRow(
+                        create_standard_box("Risk & Exceptions", uiOutput("risk_exceptions_summary"), "warning", 6),
+                        create_standard_box("Follow-Up Summary", uiOutput("financial_overview_summary"), "success", 6)                    )),
+
+            # Details Tab
+            tabItem(tabName = "details",
+                    fluidRow(
+                        create_standard_box("Contract Activity Details", list(
+                            conditionalPanel("input.monthly_review_table_rows_selected.length > 0",
+                                             h4(textOutput("selected_contract_header")),
+                                             DT::dataTableOutput("detailed_data_table"),
+                                             div(style = "margin-bottom: 15px;",
+                                                 h4("Review Mode"),
+                                                 radioButtons("review_mode", "", choices = c("Activity Review" = "activity", "Title Review" = "title"), selected = "activity", inline = TRUE)),
+                                             h4(textOutput("checklist_header")),
+                                             div(id = "checklist_container", uiOutput("dynamic_checklist"))),
+                            conditionalPanel("input.monthly_review_table_rows_selected.length == 0",
+                                             h4("Select an item from the dashboard to view details"))
+                        ), "primary", 8),
+                        create_standard_box("Scoring & Actions", list(
+                            conditionalPanel("input.monthly_review_table_rows_selected.length > 0",
+                                             actionButton("score_contract", "Score Contract", class = "btn-primary", style = "margin-bottom: 15px; width: 100%;"),
+                                             h5("Contract Score"), verbatimTextOutput("contract_score_display"), br(),
+                                             selectInput("status_update", "Update Status:", choices = c("Pending Review", "In Progress", "Completed", "Flagged")),
+                                             fluidRow(
+                                                 column(6, actionButton("save_review", "Save Review", class = "btn-success", style = "width: 100%;")),
+                                                 column(6, actionButton("flag_item", "Flag Item", class = "btn-warning", style = "width: 100%;"))
+                                             ),
+                                             textInput("reviewer_name", "Reviewer Name:", value = "Current User", placeholder = "Enter your name"),
+                                             textAreaInput("review_notes", "Review Notes:", placeholder = "Enter detailed review notes...", rows = 4),                                             h5("Follow-up Actions"),
+                                             checkboxGroupInput("followup_actions", "", choices = c("Contact customer" = "contact", "Request documentation" = "docs", "Escalate to supervisor" = "escalate", "Schedule follow-up" = "followup")),
+                                             h5("Contract Summary"), verbatimTextOutput("contract_summary")),
+                            conditionalPanel("input.monthly_review_table_rows_selected.length == 0", p("Select a contract to view scoring and actions."))
+                        ), "warning", 4)
+                    )),
+
+            # Risk Tab
+            tabItem(tabName = "risk",
+                    # KPI and filters row
+                    fluidRow(
+                        column(2),  # offset for centering
+                        valueBoxOutput("avg_quality_score"),
+                        valueBoxOutput("total_contracts_reviewed"),
+                        column(2)   # offset for centering
+                    ),
+                    fluidRow(
+                        column(2),  # offset for centering
+                        column(8, box(title = "Risk Analysis Filters", status = "info", solidHeader = TRUE, width = NULL,
+                                      fluidRow(
+                                          column(6, selectInput("risk_activity_filter", "Activity Types:",
+                                                                choices = CHOICES$activity, selected = "all", multiple = TRUE, selectize = TRUE)),
+                                          column(6, selectInput("risk_month_filter", "Months:",
+                                                                choices = NULL, selected = NULL, multiple = TRUE, selectize = TRUE))
+                                      ),
+                                      actionButton("apply_risk_filters", "Apply Filters", class = "btn-primary", style = "width: 100%; margin-top: 10px;")
+                        )),
+                        column(2)   # offset for centering
+                    ),
+
+
+                    # Performance summary table
+                    fluidRow(create_standard_box("Activity Type Performance Summary",
+                                                 DT::dataTableOutput("activity_performance_table"), "danger", 12)),
+
+                    # Charts row 1
+                    fluidRow(
+                        create_standard_box("Quality Score Trends",
+                                            plotlyOutput("quality_trends_chart", height = "300px"), "warning", 6),
+                        create_standard_box("Review Status Distribution", list(
+                            checkboxGroupInput("status_distribution_filter", "Include Statuses:",
+                                               choices = c("Pending Review", "In Progress", "Completed", "Flagged"),
+                                               selected = c("Pending Review", "In Progress", "Completed", "Flagged"),
+                                               inline = TRUE),
+                            plotlyOutput("status_distribution", height = "300px")
+                        ), "info", 6)
+                    ),
+
+                    # Charts row 2
+                    fluidRow(
+                        create_standard_box("Multi-Period Quality Analysis", list(
+                            div(style = "font-size: 12px; color: #666; margin-bottom: 10px;",
+                                "Note: Numbers in parentheses show review count for each period."),
+                            plotlyOutput("multi_period_chart", height = "350px")
+                        ), "primary", 8),
+                        create_standard_box("Activity Type Distribution",
+                                            plotlyOutput("activity_breakdown", height = "350px"), "success", 4)
+                    )
+            ),
+
+            # Correspondence & Ad Hoc Tab
+            tabItem(tabName = "correspondence_adhoc",
+                    fluidRow(
+                        create_standard_box("Correspondence & Ad Hoc Review Form", list(
+                            fluidRow(
+                                column(6, textInput("correspondence_adhoc_contract_id", "Contract ID:", placeholder = "Enter contract number")),
+                                column(6, selectInput("correspondence_adhoc_check_type", "Check Type:", choices = c("Correspondence" = "correspondence", "Ad Hoc Review" = "adhoc", "Other" = "other")))
+                            ),
+                            textInput("correspondence_adhoc_reviewer", "Reviewer Name:", value = "Current User"),
+                            h4("Quality Assessment Checklist"),
+                            div(id = "correspondence_adhoc_checklist_container", uiOutput("correspondence_adhoc_dynamic_checklist"))
+                        ), "primary", 8),
+                        create_standard_box("Scoring & Save", list(
+                            actionButton("score_correspondence_adhoc", "Score Review", class = "btn-primary", style = "width: 100%; margin-bottom: 15px;"),
+                            verbatimTextOutput("correspondence_adhoc_score_display"),
+                            selectInput("correspondence_adhoc_status", "Status:", choices = c("Completed", "In Progress", "Flagged")),
+                            textAreaInput("correspondence_adhoc_notes", "Additional Notes:", rows = 3),
+                            actionButton("save_correspondence_adhoc", "Save Review", class = "btn-success", style = "width: 100%;")
+                        ), "warning", 4)
+                    ),
+                    fluidRow(create_standard_box("Correspondence & Ad Hoc Review History", DT::dataTableOutput("correspondence_adhoc_review_table"), "info"))),
+
+            # History Tab
+            tabItem(tabName = "history",
+                    fluidRow(create_standard_box("Review History", DT::dataTableOutput("review_history_table"), "primary")))
+        )
+    )
+)
+
+# =============================================================================
+# SERVER LOGIC
+# =============================================================================
+
+server <- function(input, output, session) {
+    # Data initialization
+    load_data()
+
+    app_state <- reactiveValues(
+        current_month_range = get_prior_month_range(),
+        saved_reviews = load_saved_reviews()
+    )
+
+    # Make activity_data reactive to always use latest saved reviews
+    activity_data <- reactive({
+        base_activity_data <- create_full_activity_data()
+        merge_activity_with_reviews(base_activity_data, app_state$saved_reviews)
+    })
+
+    # Add filter trigger at top of server function (after reactiveValues)
+    filter_trigger <- reactiveVal(0)
+
+    # Force initial filter trigger
+    observe({
+        if (filter_trigger() == 0) {
+            filter_trigger(1)
+        }
+    })
+
+    # Unified data reactives
+    enriched_activity_data <- reactive({
+        req(activity_data())
+        add_dollar_amounts(activity_data(),
+                           input$high_dollar_threshold %||% CONFIG$default_high_threshold,
+                           input$low_dollar_threshold %||% CONFIG$default_low_threshold)
+    })
+
+
+    monthly_filtered_data <- reactive({
+        filter_trigger()
+
+        data <- enriched_activity_data() %>%
+            filter(cycle_date >= app_state$current_month_range$start & cycle_date <= app_state$current_month_range$end)
+
+        if (input$activity_type != "all") data <- data %>% filter(activity_type == input$activity_type)
+        if (input$review_status_filter != "all") data <- data %>% filter(review_status == input$review_status_filter)
+        if (input$contract_search != "") data <- data %>% filter(grepl(input$contract_search, contract_id, ignore.case = TRUE))
+        if (input$show_dollar_risks_only) data <- data %>% filter(dollar_risk %in% c("High Dollar", "Low Dollar"))
+
+        # Amount filtering
+        if (!is.null(input$min_amount) && !is.na(input$min_amount)) {
+            data <- data %>% filter(amount >= input$min_amount)
+        }
+        if (!is.null(input$max_amount) && !is.na(input$max_amount)) {
+            data <- data %>% filter(amount <= input$max_amount)
+        }
+        if (input$exclude_zero_amounts) {
+            data <- data %>% filter(amount > 0)
+        }
+
+        if (input$poly_company != "all") {
+            company_contracts <- policies %>%
+                filter(Policy_Contract_Company == input$poly_company) %>%
+                distinct(Policy_Contract_Number) %>% pull(Policy_Contract_Number)
+            data <- data %>% filter(contract_id %in% company_contracts)
+        }
+
+        # Group by contract_id and activity_type, take most recent record per combination
+        data <- data %>%
+            arrange(desc(cycle_date)) %>%
+            distinct(contract_id, activity_type, .keep_all = TRUE)
+
+        data
+    })
+
+
+    get_all_completed_reviews <- reactive({
+        req(app_state$saved_reviews)
+        app_state$saved_reviews %>%
+            filter(review_status == "Completed" & !is.na(quality_score)) %>%
+            mutate(review_date = as.Date(review_date))
+    })
+
+    # Shared risk filter reactive
+    risk_filtered_data <- eventReactive(input$apply_risk_filters, {
+        historical_reviews <- get_historical_reviews()
+
+        if (nrow(historical_reviews) == 0) return(historical_reviews)
+
+        # Apply activity filter
+        if (!is.null(input$risk_activity_filter) && !"all" %in% input$risk_activity_filter) {
+            historical_reviews <- historical_reviews %>%
+                filter(activity_type %in% input$risk_activity_filter)
+        }
+
+        # Apply month filter
+        if (!is.null(input$risk_month_filter) && length(input$risk_month_filter) > 0) {
+            selected_months <- as.Date(input$risk_month_filter)
+            historical_reviews <- historical_reviews %>%
+                filter(floor_date(as.Date(cycle_date), "month") %in% selected_months)
+        }
+
+        historical_reviews
+    }, ignoreNULL = FALSE)
+
+    # Month navigation
+
+
+    # Month navigation observers
+    month_buttons <- list(prev_month = -1, next_month = 1)
+    for(button_name in names(month_buttons)) {
+        local({
+            direction <- month_buttons[[button_name]]
+            button <- button_name
+            observeEvent(input[[button]], {
+                current_start <- app_state$current_month_range$start
+                new_start <- current_start + months(direction)
+                app_state$current_month_range <- list(start = new_start, end = ceiling_date(new_start, "month") - days(1))
+                filter_trigger(filter_trigger() + 1)
+            })
+        })
+    }
+
+    observeEvent(input$apply_filters, {
+        filter_trigger(filter_trigger() + 1)
+    })
+
+    output$current_month_display <- renderText({
+        if (!is.null(app_state$pending_month_range)) {
+            format(app_state$pending_month_range$start, "%B %Y")
+        } else {
+            format(app_state$current_month_range$start, "%B %Y")
+        }
+    })
+
+    output$monthly_title <- renderText({
+        paste("Items Requiring Review -", format(app_state$current_month_range$start, "%B %Y"))
+    })
+
+    # Value boxes
+    create_value_boxes <- function(data) {
+        list(
+            total_items = valueBox(nrow(data), "Total Contracts", icon = icon("list"), color = "blue"),
+            pending_items = valueBox(nrow(filter(data, review_status == "Pending Review")), "Pending Review", icon = icon("clock"), color = "aqua"),
+            completed_items = valueBox(nrow(filter(data, review_status == "Completed")), "Completed Review", icon = icon("check"), color = "olive"),
+            in_progress_items = valueBox(nrow(filter(data, review_status == "In Progress")), "Review In Progress", icon = icon("clock"), color = "yellow"),
+            flagged_items = valueBox(nrow(filter(data, review_status == "Flagged")), "Flagged Items", icon = icon("exclamation-triangle"), color = "red"),
+            dollar_risk_items = valueBox(nrow(filter(data, dollar_risk %in% c("High Dollar", "Low Dollar"))), "Dollar Risk Items", icon = icon("dollar-sign"), color = "purple")
+        )
+    }
+
+    value_boxes <- reactive({ create_value_boxes(monthly_filtered_data()) })
+
+    # Loop for standard value boxes
+    observe({
+        boxes <- value_boxes()
+        for(box_name in names(boxes)) {
+            local({
+                name <- box_name
+                output[[name]] <- renderValueBox({ boxes[[name]] })
+            })
+        }
+    })
+
+    # Special value boxes (these have custom logic)
+    output$total_contracts_reviewed <- renderValueBox({
+        completed_data <- get_all_completed_reviews()
+        total_count <- nrow(completed_data)
+        color <- if (total_count >= 100) "green" else if (total_count >= 50) "yellow" else "red"
+        valueBox(value = total_count, subtitle = "Total Contracts Reviewed", icon = icon("file-check"), color = color)
+    })
+    # Main data table
+    output$monthly_review_table <- DT::renderDataTable({
+        data <- monthly_filtered_data() %>%
+            select(
+                'Contract ID' = contract_id,
+                'Activity Type' = activity_type,
+                'Cycle Date' = cycle_date,
+                amount,
+                'Dollar Risk' = dollar_risk,
+                'Review Status' = review_status
+            )
+
+        dt_table <- DT::datatable(data, options = list(pageLength = 25, scrollX = TRUE, selection = 'single'), rownames = FALSE) %>%
+            formatCurrency("amount", currency = "$", digits = 2) %>%
+            formatStyle("Dollar Risk", backgroundColor = styleEqual(c("High Dollar", "Low Dollar"), c("#ffcccb", "#fffacd")))
+
+        dt_table
+    })
+
+    # Contract details
+    selected_row_data <- reactive({
+        if (length(input$monthly_review_table_rows_selected) > 0) {
+            return(monthly_filtered_data()[input$monthly_review_table_rows_selected, ])
+        }
+        NULL
+    })
+
+    output$selected_contract_header <- renderText({
+        selected_row <- selected_row_data()
+        if (!is.null(selected_row)) {
+            person_info <- get_contract_names(selected_row$contract_id)
+            paste("Contract:", selected_row$contract_id, "| Activity:", selected_row$activity_type, "| Owner:", person_info)
+        }
+    })
+
+    get_detail_data <- function(selected_row) {
+        activity_type <- selected_row$activity_type
+        contract_id <- selected_row$contract_id
+
+        detail_data <- switch(activity_type,
+                              "transactions" = {
+                                  transactions %>%
+                                      filter(Transaction_Contract_Number == contract_id) %>%
+                                      select(-matches("Transaction_TPA", ignore.case = TRUE))
+                              },
+                              "disbursements" = {
+                                  disbursements %>%
+                                      filter(Disbursement_Contract_Number == contract_id) %>%
+                                      select(-matches("Disbursement_TPA", ignore.case = TRUE))
+                              },
+                              "claims" = {
+                                  claims %>%
+                                      filter(Claims_Contract_Number == contract_id) %>%
+                                      select(-matches("Claims_TPA", ignore.case = TRUE))
+                              },
+                              "automated_activity" = {
+                                  automated_activity %>%
+                                      filter(Activity_Contract_Number == contract_id) %>%
+                                      select(-matches("Activity_TPA", ignore.case = TRUE))
+                              },
+                              "policies" = {
+                                  policies %>%
+                                      filter(Policy_Contract_Number == contract_id) %>%
+                                      select(-matches("Policy_TPA", ignore.case = TRUE))
+                              },
+                              "life_values" = {
+                                  life_values %>%
+                                      filter(Life_Contract_Number == contract_id) %>%
+                                      select(-matches("Life_TPA", ignore.case = TRUE))
+                              },
+                              "annuity_values" = {
+                                  annuity_values %>%
+                                      filter(Annuity_Contract_ID == contract_id)
+                              },
+                              data.frame(Message = "No detail data available")
+        )
+
+        # Clean and format the data
+        if (nrow(detail_data) > 0 && "Message" %in% names(detail_data) == FALSE) {
+            # Hide unwanted columns (all Role_, Name_, Agent_ columns)
+            detail_data <- detail_data %>%
+                select(-matches("^Role_|^Name_|^Agent_", ignore.case = TRUE))
+
+            # Clean up specific values
+            detail_data <- detail_data %>%
+                mutate(across(everything(), ~case_when(
+                    is.character(.x) & toupper(.x) %in% c("UNK", "UNKNOWN") ~ "Not Available",
+                    is.character(.x) & .x == "" ~ "Not Available",
+                    .x == "2999-12-31" ~ "Not Available",
+                    .x == "1900-01-01" ~ "Not Available",
+                    TRUE ~ as.character(.x)
+                )))
+        }
+    }
+
+
+    get_contract_names <- function(contract_id) {
+        contract_parties <- get_contract_parties(contract_id) %>%
+            filter(Role_Contract_ID == contract_id)
+
+
+
+        # Try owner first, fallback to first person (same logic as contract summary)
+        primary_person <- contract_parties %>% filter(party_type == "Owner") %>% slice(1)
+        if(nrow(primary_person) == 0) {
+            primary_person <- contract_parties %>% slice(1)
+        }
+
+        if(nrow(primary_person) == 0) return("No names found")
+
+        info_summary <- paste0(
+            primary_person$display_name,
+            if_else(!is.na(primary_person$Name_DOB), paste0(" (DOB: ", primary_person$Name_DOB, ")"), ""),
+            if_else(!is.na(primary_person$Name_Email), paste0(" | ", primary_person$Name_Email), "")
+        )
+
+        return(info_summary)
+    }
+
+    output$detailed_data_table <- DT::renderDataTable({
+        selected_row <- selected_row_data()
+        if (!is.null(selected_row)) {
+            detail_data <- get_detail_data(selected_row)
+
+            # Set different hidden columns based on activity type
+            hidden_columns <- switch(selected_row$activity_type,
+                                     "transactions" = c("Transaction_Number"),
+                                     "claims" = c("Claims_Claim_ID"),
+                                     "disbursements" = c("Disbursement_Number", "Disbursement_Name_ID", "Disbursement_Allocation_Percent"),
+                                     "automated_activity" = c("Activity_Name_ID"),
+                                     c()  # default: no hidden columns
+            )
+
+            dt_options <- list(pageLength = 10, scrollX = TRUE)
+
+            # Only add columnDefs if there are columns to hide
+            if (length(hidden_columns) > 0) {
+                dt_options$columnDefs <- list(list(visible = FALSE, targets = hidden_columns))
+            }
+
+            dt_table <- DT::datatable(detail_data, options = dt_options, rownames = FALSE)
+            format_dt_table(dt_table, detail_data)
+        }
+    })
+
+    # Checklist management
+    output$checklist_header <- renderText({
+        if (input$review_mode == "activity") "Activity Review Checklist" else "Title Quality Review Checklist"
+    })
+
+    output$dynamic_checklist <- renderUI({
+        selected_row <- selected_row_data()
+        if (!is.null(selected_row)) {
+            activity_type <- if (input$review_mode == "activity") selected_row$activity_type else "titles"
+            checklist_data <- CHECKLISTS[[activity_type]] %||% CHECKLISTS$default
+            weights <- CATEGORY_WEIGHTS[[activity_type]] %||% CATEGORY_WEIGHTS$default
+            generate_checklist_ui(checklist_data, weights, "checklist_")
+        }
+    })
+
+    # Scoring
+    contract_score <- reactive({
+        caSystem platformulate_unified_score("checklist_",
+                                if (input$review_mode == "activity") selected_row_data()$activity_type else "titles",
+                                input)
+    })
+
+    observeEvent(input$score_contract, {
+        score_data <- contract_score()
+        selected_row <- selected_row_data()
+
+        if (!is.null(selected_row)) {
+
+
+            status_msg <- if (score_data$pass) "PASSED" else "FAILED"
+            showNotification(paste("Contract scored:", score_data$score, "% -", status_msg),
+                             type = if (score_data$pass) "success" else "warning")
+        }
+    })
+
+    output$contract_score_display <- renderText({
+        score_data <- contract_score()
+        status <- if (score_data$pass) "PASS" else "FAIL"
+
+        category_text <- ""
+        if (length(score_data$category_details) > 0) {
+            for (category in names(score_data$category_details)) {
+                details <- score_data$category_details[[category]]
+                weighted_score <- round(score_data$category_scores[[category]], 1)
+                category_text <- paste0(category_text, stringr::str_to_title(category), ": ",
+                                        details$checked, "/", details$total, " (", details$percentage, "%) = ", weighted_score, " pts\n")
+            }
+        }
+
+        paste("Overall Score:", score_data$score, "%\nStatus:", status, "\n\nCategory Breakdown:\n", category_text)
+    })
+
+    output$contract_summary <- renderText({
+        selected_row <- selected_row_data()
+        if (!is.null(selected_row)) {
+            contract_id <- selected_row$contract_id
+
+            tryCatch({
+                # Get all roles for this contract
+                all_roles <- agent_name_role_lookup %>%
+                    filter(Role_Contract_ID == contract_id) %>%
+                    filter(!grepl("rep", Role_Type, ignore.case = TRUE)) %>%
+                    mutate(
+                        display_name = case_when(
+                            !is.na(Name_First_Name) & !is.na(Name_Legal_Name) &
+                                Name_First_Name != "" & Name_Legal_Name != "" ~
+                                paste(Name_First_Name, Name_Legal_Name),
+                            !is.na(Name_Legal_Name) & Name_Legal_Name != "" ~ Name_Legal_Name,
+                            TRUE ~ paste("ID:", Role_Name_ID)
+                        ),
+                        has_rider = !is.na(Role_Rider_Code) & Role_Rider_Code != "",
+                        allocation_display = ifelse(!is.na(Role_Allocation_Percent),
+                                                    paste0(Role_Allocation_Percent, "%"), "N/A"),
+                        relationship_display = ifelse(!is.na(Role_Relationship_Code) & Role_Relationship_Code != -999,
+                                                      Role_Relationship_Code, "N/A")
+                    ) %>%
+                    arrange(Role_Type, display_name)
+
+                if (nrow(all_roles) == 0) {
+                    return("No role information available for this contract")
+                }
+
+                # Build role details section
+                role_details <- ""
+                for (i in 1:nrow(all_roles)) {
+                    role <- all_roles[i, ]
+
+                    # Special case for "bene info on file"
+                    if (!is.na(role$Name_Legal_Name) && tolower(role$Name_Legal_Name) == "bene info on file") {
+                        role_details <- paste0(role_details, role$Role_Type, ": bene info on file\n")
+                        next
+                    }
+
+
+                    # Skip allocation and relationship for org roles
+                    if (tolower(role$Role_Type) == "org") {
+                        role_line <- paste0(role$Role_Type, ": ", role$display_name)
+                    } else {
+                        # Build role line with non-N/A values only
+                        role_parts <- c(paste0(role$Role_Type, ": ", role$display_name))
+
+                        if (role$allocation_display != "N/A") {
+                            role_parts <- c(role_parts, paste("Allocation:", role$allocation_display))
+                        }
+
+                        if (role$relationship_display != "N/A") {
+                            role_parts <- c(role_parts, paste("Relationship:", role$relationship_display))
+                        }
+
+                        role_line <- paste(role_parts, collapse = " | ")
+                    }
+
+                    role_line <- paste(role_parts, collapse = " | ")
+
+                    # Add rider info if present
+                    if (role$has_rider) {
+                        role_line <- paste0(role_line, " | Rider: ", role$Role_Rider_Code)
+                    }
+
+                    # Add agent organization if this is an agent role
+                    if (is_agent_role(role$Role_Type) && !is.na(role$Agent_Organization_Name)) {
+                        role_line <- paste0(role_line, " | Org: ", role$Agent_Organization_Name)
+                    }
+
+                    role_details <- paste0(role_details, role_line, "\n")
+                }
+
+                # Get policy and activity summary
+                policy_info <- policies %>% filter(Policy_Contract_Number == contract_id) %>% slice(1)
+                policy_summary <- if(nrow(policy_info) > 0) {
+                    paste0(policy_info$Policy_Product_Description %||% "Unknown Product",
+                           ifelse(!is.na(policy_info$Policy_Issue_Date),
+                                  paste0(" (Issued: ", policy_info$Policy_Issue_Date, ")"), ""))
+                } else "No Policy Info"
+
+                # Activity counts
+                trans_count <- nrow(transactions %>% filter(Transaction_Contract_Number == contract_id))
+                disb_count <- nrow(disbursements %>% filter(Disbursement_Contract_Number == contract_id))
+                claim_count <- nrow(claims %>% filter(Claims_Contract_Number == contract_id))
+
+                # Check for any riders on this contract
+                contract_riders <- all_roles %>% filter(has_rider) %>% pull(Role_Rider_Code) %>% unique()
+                rider_summary <- if(length(contract_riders) > 0) {
+                    paste0("\nRiders: ", paste(contract_riders, collapse = ", "))
+                } else "\nRiders: None"
+
+                # TPA sources
+                tpa_sources <- all_roles %>% filter(!is.na(Role_TPA)) %>% pull(Role_TPA) %>% unique()
+                tpa_summary <- if(length(tpa_sources) > 0) {
+                    paste0("\nTPA Sources: ", paste(tpa_sources, collapse = ", "))
+                } else ""
+
+                # Check for agents (only show for comm rep or serv rep roles)
+                agent_roles <- all_roles %>%
+                    filter(is_agent_role(Role_Type)) %>%
+                    select(display_name, Agent_Organization_Name) %>%
+                    distinct()
+
+                agent_summary <- if(nrow(agent_roles) > 0) {
+                    agent_text <- agent_roles %>%
+                        mutate(agent_info = paste0(display_name,
+                                                   ifelse(!is.na(Agent_Organization_Name),
+                                                          paste0(" (", Agent_Organization_Name, ")"), ""))) %>%
+                        pull(agent_info) %>%
+                        paste(collapse = ", ")
+                    paste0("\nAgents: ", agent_text)
+                } else ""
+
+                formatted_amount <- ifelse(is.na(selected_row$amount) | selected_row$amount == 0,
+                                           "$0.00", dollar(selected_row$amount, accuracy = 0.01))
+
+                paste("Contract Summary:",
+                      "\n--- Policy Info ---",
+                      "\nProduct:", policy_summary,
+                      rider_summary,
+                      tpa_summary,
+                      agent_summary,
+                      "\n--- All Contract Roles ---",
+                      "\n", role_details,
+                      "\n--- Activity Summary ---",
+                      "\nTransactions:", trans_count,
+                      "\nDisbursements:", disb_count,
+                      "\nClaims:", claim_count,
+                      "\nLast Activity:", selected_row$cycle_date,
+                      "\nAmount:", formatted_amount,
+                      "\nDollar Risk:", selected_row$dollar_risk)
+
+            }, error = function(e) {
+                paste("Error loading contract summary:", e$message)
+            })
+        } else {
+            "Select a contract to view summary"
+        }
+    })
+
+    # Save review action
+    observeEvent(input$save_review, {
+        selected_row <- selected_row_data()
+        score_data <- contract_score()
+
+        if (!is.null(selected_row)) {
+            followup_string <- paste(input$followup_actions, collapse = ", ")
+
+            review_record <- data.frame(
+                contract_id = selected_row$contract_id, activity_type = selected_row$activity_type, original_id = selected_row$original_id,
+                cycle_date = selected_row$cycle_date, review_status = input$status_update, quality_score = score_data$score,
+                checklist_completed = score_data$checked, checklist_total = score_data$total, quality_pass = score_data$pass,
+                review_notes = ifelse(is.null(input$review_notes) || input$review_notes == "", "", input$review_notes),
+                follow_up_actions = followup_string, reviewed_by = input$reviewer_name %||% "Current User", review_date = Sys.Date(),
+                review_mode = input$review_mode, regulatory_score = NA, financial_score = NA, process_score = NA,
+                category_scores = paste(names(score_data$category_scores), unlist(score_data$category_scores), sep = ":", collapse = ";"),
+                stringsAsFactors = FALSE
+            )
+
+            app_state$saved_reviews <- save_review_to_parquet(review_record)
+
+
+            showNotification("Review saved successfully!", type = "message")
+            updateTextAreaInput(session, "review_notes", value = "")
+            updateCheckboxGroupInput(session, "followup_actions", selected = character(0))
+
+            # Add this line:
+            filter_trigger(filter_trigger() + 1)
+        }
+    })
+
+    observeEvent(input$flag_item, {
+        selected_row <- selected_row_data()
+        if (!is.null(selected_row)) {
+            review_record <- data.frame(
+                contract_id = selected_row$contract_id, activity_type = selected_row$activity_type, original_id = selected_row$original_id,
+                cycle_date = selected_row$cycle_date, review_status = "Flagged", quality_score = NA_real_,
+                checklist_completed = NA_integer_, checklist_total = CONFIG$default_checklist_total, quality_pass = FALSE,
+                review_notes = "FLAGGED: Requires additional review", follow_up_actions = "escalate", reviewed_by = "Current User",
+                review_date = Sys.Date(), review_mode = input$review_mode, regulatory_score = NA_real_, financial_score = NA_real_,
+                process_score = NA_real_, category_scores = "{}", stringsAsFactors = FALSE
+            )
+
+            app_state$saved_reviews <- save_review_to_parquet(review_record)
+
+
+            showNotification("Item flagged and saved", type = "warning")
+
+            # Add this line:
+            filter_trigger(filter_trigger() + 1)
+        }
+    })
+
+    observeEvent(input$review_mode, {
+        if (!is.null(selected_row_data())) {
+            reset_checkboxes(session, "checklist_", 50)
+        }
+    })
+
+    # Summary outputs
+    output$overall_performance_summary <- renderUI({
+        completed_data <- get_all_completed_reviews()
+        all_month_data <- monthly_filtered_data()
+        current_month <- format(app_state$current_month_range$start, "%B")
+
+        if (nrow(completed_data) == 0) {
+            return(HTML(paste0("<p>No completed reviews available for ", current_month, ". Begin conducting reviews to generate performance metrics.</p>")))
+        }
+
+        current_score <- round(mean(completed_data$quality_score, na.rm = TRUE), 1)
+        current_volume <- nrow(all_month_data)
+        completed_count <- nrow(completed_data)
+        completion_rate <- round((completed_count / current_volume) * 100, 1)
+
+        summary_text <- paste0(
+            "<p>", current_month, " oversight review has completed ", completed_count, " of ", current_volume,
+            " items (", completion_rate, "% completion rate). Quality assessment averaged ", current_score, "% across completed reviews.</p>",
+            "<p>Performance metrics are based on actual completed assessments. ",
+            if (current_score >= 85) "Quality scores exceed target standards."
+            else if (current_score >= 80) "Quality scores meet acceptable standards."
+            else "Quality scores indicate need for process improvement.", "</p>"
+        )
+        HTML(summary_text)
+    })
+
+    output$current_status_summary <- renderUI({
+        all_data <- monthly_filtered_data()
+        if (nrow(all_data) == 0) return(HTML("<p>No data available for current month.</p>"))
+
+        activity_breakdown <- all_data %>%
+            group_by(activity_type) %>%
+            summarise(total = n(), completed = sum(review_status == "Completed"), .groups = 'drop') %>%
+            mutate(completion_rate = round((completed / total) * 100, 0),
+                   status_text = paste0(gsub("_", " ", stringr::str_to_title(activity_type)), ": ", completed, "/", total, " (", completion_rate, "%)")) %>%
+            arrange(desc(total))
+
+        flagged_count <- nrow(all_data %>% filter(review_status == "Flagged"))
+        in_progress_count <- nrow(all_data %>% filter(review_status == "In Progress"))
+
+        activity_text <- paste(activity_breakdown$status_text, collapse = ", ")
+        priority_activities <- activity_breakdown %>% filter(completion_rate < 75 & total >= 3) %>% pull(activity_type)
+
+        summary_text <- paste0(
+            "<p><strong>Activity Completion Status:</strong> ", activity_text, ".</p>",
+            "<p>", if (flagged_count > 0) paste0(flagged_count, " items flagged for escalation. "),
+            if (in_progress_count > 0) paste0(in_progress_count, " reviews in progress. "),
+            if (length(priority_activities) > 0) paste0("<strong>Priority focus needed:</strong> ", paste(priority_activities, collapse = ", "), " (below 75% completion).")
+            else "All activity types meeting completion targets.", "</p>"
+        )
+        HTML(summary_text)
+    })
+
+    output$risk_exceptions_summary <- renderUI({
+        all_data <- monthly_filtered_data()
+        completed_data <- get_all_completed_reviews()
+
+        flagged_count <- nrow(all_data %>% filter(review_status == "Flagged"))
+        high_dollar_count <- nrow(all_data %>% filter(dollar_risk == "High Dollar"))
+        low_dollar_count <- nrow(all_data %>% filter(dollar_risk == "Low Dollar"))
+
+        lowest_contracts <- completed_data %>%
+            filter(!is.na(quality_score)) %>%
+            arrange(quality_score) %>%
+            head(3) %>%
+            mutate(contract_summary = paste0(contract_id, " (", gsub("_", "", activity_type), "): ", round(quality_score, 1), "%"))
+
+        summary_text <- paste0(
+            "<p><strong>Risk Assessment:</strong> ",
+            if (flagged_count > 0) paste0(flagged_count, " items flagged for supervisory review. ") else "No items require escalated review. ",
+            if (high_dollar_count > 0 || low_dollar_count > 0) paste0("Dollar threshold analysis: ", high_dollar_count + low_dollar_count, " transactions (",
+                                                                      high_dollar_count, " high-value, ", low_dollar_count, " low-value).") else "All transactions within standard thresholds.", "</p>",
+            "<p><strong>Lowest-Scoring Contracts:</strong> ",
+            if (nrow(lowest_contracts) > 0) paste0(paste(lowest_contracts$contract_summary, collapse = "; "), ". These contracts require immediate management attention.")
+            else "No completed reviews available for risk scoring analysis.", "</p>"
+        )
+        HTML(summary_text)
+    })
+
+    output$financial_overview_summary <- renderUI({
+        month_reviews <- app_state$saved_reviews %>%
+            filter(cycle_date >= app_state$current_month_range$start & cycle_date <= app_state$current_month_range$end & review_status == "Completed")
+
+        if (nrow(month_reviews) == 0) {
+            return(HTML("<p><strong>Follow-Up Summary:</strong> No completed reviews available for follow-up analysis.</p>"))
+        }
+
+        reviews_with_followup <- month_reviews %>%
+            filter(!is.na(follow_up_actions) & follow_up_actions != "")
+
+        total_completed <- nrow(month_reviews)
+        followup_count <- nrow(reviews_with_followup)
+        followup_rate <- round((followup_count / total_completed) * 100, 1)
+
+        # Categorize follow-up actions
+        action_counts <- list(contact = 0, docs = 0, escalate = 0, followup = 0)
+
+        if (followup_count > 0) {
+            for (i in 1:nrow(reviews_with_followup)) {
+                actions <- unlist(strsplit(reviews_with_followup$follow_up_actions[i], ", "))
+                for (action in actions) {
+                    if (action %in% names(action_counts)) {
+                        action_counts[[action]] <- action_counts[[action]] + 1
+                    }
+                }
+            }
+        }
+
+        # Activity types generating most follow-ups
+        followup_by_activity <- reviews_with_followup %>%
+            group_by(activity_type) %>%
+            summarise(count = n(), .groups = 'drop') %>%
+            arrange(desc(count))
+
+        top_activity <- if (nrow(followup_by_activity) > 0) {
+            paste0(gsub("_", " ", stringr::str_to_title(followup_by_activity$activity_type[1])),
+                   " (", followup_by_activity$count[1], " items)")
+        } else {
+            "None"
+        }
+
+        # Build action breakdown text
+        action_text <- ""
+        if (action_counts$contact > 0) action_text <- paste0(action_text, action_counts$contact, " customer contacts, ")
+        if (action_counts$docs > 0) action_text <- paste0(action_text, action_counts$docs, " documentation requests, ")
+        if (action_counts$escalate > 0) action_text <- paste0(action_text, action_counts$escalate, " escalations, ")
+        if (action_counts$followup > 0) action_text <- paste0(action_text, action_counts$followup, " follow-up meetings, ")
+
+        action_text <- gsub(", $", "", action_text)
+        if (action_text == "") action_text <- "No specific actions recorded"
+
+        summary_text <- paste0(
+            "<p><strong>Follow-Up Summary:</strong> ", followup_count, " of ", total_completed,
+            " completed reviews (", followup_rate, "%) require follow-up actions.</p>",
+            "<p><strong>Action Types:</strong> ", action_text, ".</p>",
+            "<p><strong>Priority Items:</strong> ",
+            if (action_counts$escalate > 0) paste0(action_counts$escalate, " items flagged for supervisory escalation. ") else "No items require escalation. ",
+            "<strong>Top Source:</strong> ", top_activity, " generating most follow-ups.</p>"
+        )
+        HTML(summary_text)
+    })
+
+    # Risk monitoring outputs
+    # Loop for quality score boxes (they share similar logic)
+    quality_score_boxes <- c("avg_quality_score", "summary_overall_score")
+    for(box_name in quality_score_boxes) {
+        local({
+            name <- box_name
+            output[[name]] <- renderValueBox({
+                completed_data <- get_all_completed_reviews()
+                if (nrow(completed_data) == 0) {
+                    avg_score <- "No Data"
+                    color <- "blue"
+                } else {
+                    avg_score_num <- round(mean(completed_data$quality_score, na.rm = TRUE), 1)
+                    avg_score <- paste0(avg_score_num, "%")
+                    color <- if (avg_score_num >= 85) "green" else if (avg_score_num >= 80) "yellow" else "red"
+                }
+                subtitle <- if(name == "avg_quality_score") "Average Quality Score" else "Overall Quality Score"
+                icon_name <- if(name == "avg_quality_score") "star" else "chart-line"
+                valueBox(value = avg_score, subtitle = subtitle, icon = icon(icon_name), color = color)
+            })
+        })
+    }
+
+    # Simplified chart outputs
+    output$quality_trends_chart <- renderPlotly({
+        # Use get_historical_reviews() directly if no filters applied, otherwise use filtered data
+        if (input$apply_risk_filters == 0) {
+            filtered_data <- get_historical_reviews()
+        } else {
+            filtered_data <- risk_filtered_data()
+        }
+
+        if (nrow(filtered_data) == 0) {
+            return(plot_ly() %>% add_text(x = 0.5, y = 0.5, text = "No data available for selected filters"))
+        }
+
+        trend_data <- filtered_data %>%
+            mutate(cycle_month = floor_date(as.Date(cycle_date), "month")) %>%
+            group_by(cycle_month) %>%
+            summarise(
+                quality_score = round(mean(quality_score, na.rm = TRUE), 1),
+                review_count = n(),
+                .groups = 'drop'
+            ) %>%
+            filter(!is.na(cycle_month) & !is.na(quality_score) & is.finite(quality_score)) %>%
+            arrange(cycle_month)
+
+        p <- ggplot(trend_data, aes(x = cycle_month, y = quality_score)) +
+            geom_line(linewidth = 1.2, color = "#007bff") +
+            geom_point(aes(text = paste("Month:", format(cycle_month, "%b %Y"),
+                                        "<br>Score:", quality_score, "%",
+                                        "<br>Reviews:", review_count)),
+                       size = 3, color = "#007bff") +
+            geom_hline(yintercept = 80, linetype = "dashed", color = "red", alpha = 0.7) +
+            labs(x = "Month", y = "Quality Score (%)") +
+            scale_x_date(date_labels = "%b %Y", date_breaks = "1 month") +
+            scale_y_continuous(limits = c(0, 100)) +
+            theme_minimal() +
+            theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+        ggplotly(p, tooltip = "text")
+    })
+
+    output$status_distribution <- renderPlotly({
+        # Use current month data if no risk filters applied, otherwise use filtered data
+        if (is.null(input$risk_month_filter) || length(input$risk_month_filter) == 0) {
+            data <- monthly_filtered_data()
+        } else {
+            selected_months <- as.Date(input$risk_month_filter)
+            data <- enriched_activity_data() %>%
+                filter(floor_date(as.Date(cycle_date), "month") %in% selected_months)
+
+            if (!is.null(input$risk_activity_filter) && !"all" %in% input$risk_activity_filter) {
+                data <- data %>% filter(activity_type %in% input$risk_activity_filter)
+            }
+        }
+
+        data <- data %>%
+            filter(review_status %in% input$status_distribution_filter)
+
+        status_data <- data %>%
+            group_by(review_status) %>%
+            summarise(count = n(), .groups = 'drop')
+
+        if (nrow(status_data) == 0) {
+            return(plot_ly() %>% add_text(x = 0.5, y = 0.5, text = "No status data available"))
+        }
+
+        p <- ggplot(status_data, aes(x = review_status, y = count, fill = review_status)) +
+            geom_bar(stat = "identity", width = 0.6, alpha = 0.8) +
+            geom_text(aes(label = count), vjust = -0.3, size = 3.5) +
+            labs(x = "Status", y = "Count") +
+            theme_minimal() +
+            theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+
+        ggplotly(p)
+    })
+
+    output$activity_breakdown <- renderPlotly({
+        # Use current filtered data or all data based on risk filters
+        if (is.null(input$risk_month_filter) || length(input$risk_month_filter) == 0) {
+            data <- enriched_activity_data()
+        } else {
+            selected_months <- as.Date(input$risk_month_filter)
+            data <- enriched_activity_data() %>%
+                filter(floor_date(as.Date(cycle_date), "month") %in% selected_months)
+        }
+
+        # Apply activity filter
+        if (!is.null(input$risk_activity_filter) && !"all" %in% input$risk_activity_filter) {
+            data <- data %>% filter(activity_type %in% input$risk_activity_filter)
+        }
+
+        breakdown_data <- data %>%
+            group_by(activity_type) %>%
+            summarise(count = n(), .groups = 'drop') %>%
+            mutate(
+                activity_name = gsub("_", " ", stringr::str_to_title(activity_type)),
+                percentage = round((count / sum(count)) * 100, 1)
+            ) %>%
+            arrange(desc(count))
+
+        if (nrow(breakdown_data) == 0) {
+            return(plot_ly() %>% add_text(x = 0.5, y = 0.5, text = "No breakdown data available"))
+        }
+
+        p <- ggplot(breakdown_data, aes(x = reorder(activity_name, count), y = count, fill = activity_name)) +
+            geom_bar(stat = "identity", width = 0.7, alpha = 0.8) +
+            geom_text(aes(label = paste0(count, " (", percentage, "%)")),
+                      hjust = -0.1, size = 3) +
+            coord_flip() +
+            labs(x = "", y = "Count") +
+            theme_minimal() +
+            theme(legend.position = "none")
+
+        ggplotly(p)
+    })
+
+    # Month choices observer for multi-period analysis
+    get_historical_reviews <- reactive({
+        req(app_state$saved_reviews)
+        cutoff_date <- floor_date(Sys.Date() - months(12), "month")
+
+        app_state$saved_reviews %>%
+            filter(!is.na(quality_score) & !is.na(review_date)) %>%
+            filter(as.Date(cycle_date) >= cutoff_date) %>%
+            mutate(
+                review_date = as.Date(review_date),
+                cycle_date = as.Date(cycle_date),
+                month_year = floor_date(cycle_date, "month")
+            )
+    })
+
+    observe({
+        historical_reviews <- get_historical_reviews()
+        if (nrow(historical_reviews) > 0) {
+            available_months <- historical_reviews %>%
+                distinct(month_year) %>%
+                arrange(desc(month_year)) %>%
+                mutate(
+                    month_label = format(month_year, "%B %Y"),
+                    month_value = as.character(month_year)
+                )
+
+            if (nrow(available_months) > 0) {
+                month_choices <- setNames(available_months$month_value, available_months$month_label)
+                default_months <- head(available_months$month_value, 6) # Show last 6 months by default
+
+                updateSelectInput(session, "risk_month_filter",
+                                  choices = month_choices,
+                                  selected = default_months)
+            }
+        }
+    })
+
+    output$multi_period_chart <- renderPlotly({
+        filtered_data <- risk_filtered_data()
+
+        if (nrow(filtered_data) == 0) {
+            return(plot_ly() %>% add_text(x = 0.5, y = 0.5, text = "No data available for selected filters"))
+        }
+
+        chart_data <- filtered_data %>%
+            mutate(
+                month_label = format(month_year, "%b %Y"),
+                activity_display = case_when(
+                    activity_type == "transactions" ~ "Transactions",
+                    activity_type == "disbursements" ~ "Disbursements",
+                    activity_type == "claims" ~ "Claims",
+                    activity_type == "automated_activity" ~ "Auto Activity",
+                    activity_type == "policies" ~ "Policy Changes",
+                    activity_type == "annuity_values" ~ "Annuity Values",
+                    activity_type == "life_values" ~ "Life Values",
+                    TRUE ~ activity_type
+                )
+            ) %>%
+            group_by(month_label, activity_display, month_year) %>%
+            summarise(
+                avg_quality = round(mean(quality_score, na.rm = TRUE), 1),
+                review_count = n(),
+                .groups = 'drop'
+            ) %>%
+            arrange(month_year)
+
+        if (nrow(chart_data) == 0) {
+            return(plot_ly() %>% add_text(x = 0.5, y = 0.5, text = "No chart data available"))
+        }
+
+        p <- ggplot(chart_data, aes(x = month_label, y = avg_quality, fill = activity_display)) +
+            geom_bar(stat = "identity", position = "dodge", alpha = 0.8, width = 0.7) +
+            geom_text(aes(label = paste0(avg_quality, "%\n(", review_count, ")")),
+                      position = position_dodge(width = 0.7),
+                      vjust = -0.3, size = 2.8) +
+            labs(x = "Month", y = "Average Quality Score (%)", fill = "Activity Type") +
+            scale_y_continuous(limits = c(0, 105), breaks = seq(0, 100, 20)) +
+            theme_minimal() +
+            theme(
+                axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+                legend.position = "top",
+                legend.title = element_text(size = 10),
+                legend.text = element_text(size = 9)
+            ) +
+            scale_fill_brewer(type = "qual", palette = "Set2")
+
+        ggplotly(p, tooltip = c("x", "y", "fill"))
+    })
+
+    # Activity performance table
+    output$activity_performance_table <- DT::renderDataTable({
+        completed_data <- get_all_completed_reviews()
+        if (nrow(completed_data) == 0) {
+            return(DT::datatable(data.frame(Message = "No completed reviews available"), rownames = FALSE))
+        }
+
+        activity_summary <- completed_data %>%
+            group_by(activity_type) %>%
+            summarise(
+                `Contracts Reviewed` = n(),
+                `Overall Score` = paste0(round(mean(quality_score, na.rm = TRUE), 1), "%"),
+                `Pass Rate` = paste0(round(mean(quality_pass, na.rm = TRUE) * 100, 1), "%"),
+                .groups = 'drop'
+            ) %>%
+            rename(`Activity Type` = activity_type)
+
+        DT::datatable(activity_summary, options = list(pageLength = 10, scrollX = TRUE), rownames = FALSE)
+    })
+
+    # Review history table
+    output$review_history_table <- DT::renderDataTable({
+        if (nrow(app_state$saved_reviews) == 0) {
+            return(DT::datatable(data.frame(Message = "No review history available"), rownames = FALSE))
+        }
+
+        activity_amounts <- enriched_activity_data() %>% select(contract_id, activity_type, original_id, amount)
+        history_with_amounts <- app_state$saved_reviews %>%
+            left_join(activity_amounts, by = c("contract_id", "activity_type", "original_id"))
+
+        display_data <- history_with_amounts %>%
+            select(`Contract ID` = contract_id, `Activity Type` = activity_type, `Review Date` = review_date,
+                   `Amount` = amount, `Status` = review_status, `Quality Score` = quality_score, `Pass/Fail` = quality_pass, `Reviewed By` = reviewed_by, `Notes` = review_notes) %>%
+            mutate(
+                `Amount` = ifelse(is.na(`Amount`) | `Amount` == 0, "$0.00", dollar(`Amount`, accuracy = 0.01)),
+                `Quality Score` = ifelse(is.na(`Quality Score`), "N/A", paste0(round(`Quality Score`, 1), "%")),
+                `Pass/Fail` = ifelse(`Pass/Fail`, "PASS", "FAIL")
+            ) %>%
+            arrange(desc(`Review Date`))
+
+        DT::datatable(display_data, options = list(pageLength = 25, scrollX = TRUE), rownames = FALSE, filter = 'top') %>%
+            formatStyle("Pass/Fail", backgroundColor = styleEqual(c("PASS", "FAIL"), c("#d4edda", "#f8d7da")))
+    })
+
+    # Correspondence & Ad Hoc functionality
+    output$correspondence_adhoc_dynamic_checklist <- renderUI({
+        check_type <- input$correspondence_adhoc_check_type %||% "correspondence"
+        checklist_data <- CHECKLISTS$correspondence_adhoc[[check_type]]
+
+        if (is.null(checklist_data)) return(div("Select a check type"))
+
+        weights <- setNames(rep(round(100 / length(checklist_data)), length(checklist_data)), names(checklist_data))
+        generate_checklist_ui(checklist_data, weights, "correspondence_adhoc_checklist_")
+    })
+
+    correspondence_adhoc_score <- reactive({
+        caSystem platformulate_unified_score("correspondence_adhoc_checklist_", "correspondence_adhoc", input)
+    })
+
+    output$correspondence_adhoc_score_display <- renderText({
+        score_data <- correspondence_adhoc_score()
+        status <- if (score_data$pass) "PASS" else "FAIL"
+
+        category_text <- ""
+        if (length(score_data$category_details) > 0) {
+            for (category in names(score_data$category_details)) {
+                details <- score_data$category_details[[category]]
+                weighted_score <- round(score_data$category_scores[[category]], 1)
+                category_text <- paste0(category_text, stringr::str_to_title(category), ": ",
+                                        details$checked, "/", details$total, " (", details$percentage, "%) = ", weighted_score, " pts\n")
+            }
+        }
+
+        paste("Overall Score:", score_data$score, "%\nStatus:", status, "\n\nCategory Breakdown:\n", category_text)
+    })
+
+    observeEvent(input$save_correspondence_adhoc, {
+        req(input$correspondence_adhoc_contract_id, input$correspondence_adhoc_check_type)
+        score_data <- correspondence_adhoc_score()
+
+        review_record <- data.frame(
+            contract_id = input$correspondence_adhoc_contract_id, activity_type = "correspondence_adhoc",
+            original_id = paste("correspondence_adhoc", input$correspondence_adhoc_check_type, format(Sys.time(), "%Y%m%d_%H%M%S"), sep = "_"),
+            cycle_date = Sys.Date(), review_status = input$correspondence_adhoc_status, quality_score = score_data$score,
+            checklist_completed = score_data$checked, checklist_total = score_data$total, quality_pass = score_data$pass,
+            review_notes = paste0("Check Type: ", input$correspondence_adhoc_check_type, " | ", input$correspondence_adhoc_notes),
+            follow_up_actions = "", reviewed_by = input$correspondence_adhoc_reviewer, review_date = Sys.Date(),
+            review_mode = "correspondence_adhoc", regulatory_score = NA, financial_score = NA, process_score = NA,
+            category_scores = paste(names(score_data$category_scores), unlist(score_data$category_scores), sep = ":", collapse = ";"),
+            stringsAsFactors = FALSE
+        )
+
+        app_state$saved_reviews <- save_review_to_parquet(review_record)
+
+        showNotification("Correspondence & Ad Hoc review saved successfully!", type = "message")
+
+        # Reset form
+        form_resets <- list(
+            correspondence_adhoc_contract_id = "",
+            correspondence_adhoc_notes = ""
+        )
+        for(input_id in names(form_resets)) {
+            if(grepl("notes", input_id)) {
+                updateTextAreaInput(session, input_id, value = form_resets[[input_id]])
+            } else {
+                updateTextInput(session, input_id, value = form_resets[[input_id]])
+            }
+        }
+        reset_checkboxes(session, "correspondence_adhoc_checklist_", 20)
+    })
+
+
+    output$correspondence_adhoc_review_table <- DT::renderDataTable({
+        correspondence_reviews <- app_state$saved_reviews %>% filter(activity_type == "correspondence_adhoc")
+
+        if (nrow(correspondence_reviews) == 0) {
+            return(DT::datatable(data.frame(Message = "No correspondence & ad hoc reviews recorded"), rownames = FALSE))
+        }
+
+        display_data <- correspondence_reviews %>%
+            mutate(
+                check_type = case_when(
+                    grepl("Check Type: correspondence", review_notes) ~ "Correspondence",
+                    grepl("Check Type: adhoc", review_notes) ~ "Ad Hoc Review",
+                    grepl("Check Type: other", review_notes) ~ "Other",
+                    TRUE ~ "Unknown"
+                ),
+                notes_cleaned = gsub("^Check Type: [^|]+ \\| ", "", review_notes)
+            ) %>%
+            select(`Contract ID` = contract_id, `Check Type` = check_type, `Review Date` = review_date,
+                   `Quality Score` = quality_score, `Status` = review_status, `Pass/Fail` = quality_pass,
+                   `Reviewed By` = reviewed_by, `Notes` = notes_cleaned) %>%
+            mutate(`Quality Score` = paste0(round(`Quality Score`, 1), "%"),
+                   `Pass/Fail` = ifelse(`Pass/Fail`, "PASS", "FAIL")) %>%
+            arrange(desc(`Review Date`))
+
+        DT::datatable(display_data, options = list(pageLength = 25, scrollX = TRUE), rownames = FALSE) %>%
+            formatStyle("Pass/Fail", backgroundColor = styleEqual(c("PASS", "FAIL"), c("#d4edda", "#f8d7da")))
+    })
+}
+
+# Launch application
+shinyApp(ui = ui, server = server)
