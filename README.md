@@ -3,6 +3,8 @@
 **End-to-end TPA oversight system processing 1-100M rows from 120,000+ insurance policies for risk monitoring, quality assessment, and regulatory compliance.**
 
 <img width="1909" height="1045" alt="tpa-dashboard-img" src="https://github.com/user-attachments/assets/5b0f8221-13a9-4bde-bf22-73d1901d1c18" />
+
+
 ## Architecture
 
 **ETL Pipeline** (`insurance_data_processing.Rmd`)
